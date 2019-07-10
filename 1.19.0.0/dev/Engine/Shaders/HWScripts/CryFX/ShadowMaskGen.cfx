@@ -1,0 +1,1156 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi" 
+#include "PostEffectsLib.cfi"
+
+//--------------------------------------------------------------------------------------------------
+// Shadow mapping parameters and resources. TODO: NEEDS CLEANUP!
+//--------------------------------------------------------------------------------------------------
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+    string Script =
+            "NoPreview;"
+            "LocalConstants;"
+            "ShaderDrawType = Custom;"
+            "ShaderType = PostProcess;"
+>;
+
+#ifdef %ST_FIXED_POINT
+    Texture2D<uint> sceneDepthTexture : TS_ShadowMaskZTarget;
+#else
+    Texture2D<float4> sceneDepthTexture : TS_ShadowMaskZTarget;
+#endif
+Texture2DMS<float4> sceneDepthTextureMS : TS_ZTargetMS;
+
+Texture2D<float4> sceneGBufferA : TS_SceneNormals;
+Texture2D<float4> sceneGBufferB : TS_SceneDiffuse;
+Texture2D<float4> sceneGBufferC : TS_SceneSpecular;
+
+sampler2D globalScatterSampler = sampler_state
+{
+    Texture = textures/lights/beam_glow.dds;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = NONE;
+    AddressU = Wrap;
+    AddressV = Wrap;  
+};
+
+#include "ShadowCommon.cfi"
+
+// Basic shadow maps support.
+
+float4x4 CompMatrix : PI_Composite < vsregister = c0; >;    // View*Projection
+
+float4 vProjRatios : PB_TempData[0];
+
+// Rotation to light space.
+float4x4 RotMatrix        : PB_TempMatr0[1];
+float4x4 BlendTexGen      : PB_TempMatr0[2];
+float4   BlendTcNormalize : PB_TempData[6];	
+
+// TODO: Reserve params for common shaders.
+float4 vWBasisX		    : PB_TempData[10];
+float4 vWBasisY		    : PB_TempData[11];
+float4 vWBasisZ		    : PB_TempData[12];
+float4 vBasisMagnitudes : PB_TempData[14];
+
+// XBOX // ACCEPTED_USE
+float4 ScreenSpaceOffset[4] < register = c32 ; >
+
+float4 BlendInfo : PB_TempData[15];
+
+// debug shadow cascade color
+float4 DebugCascadeColor;
+
+//--------------------------------------------------------------------------------------------------
+// Structs. TODO: Cleanup these ugly names and remove duplicates.
+//--------------------------------------------------------------------------------------------------
+
+struct pixout_cl
+{
+    half4 Color : COLOR0;
+};
+
+struct pixout_cl_depth
+{
+    float4 Color : COLOR0;
+    float Depth  : DEPTH;
+};
+
+struct app2vertShadow
+{
+    IN_P
+    IN_TBASE
+    float3 viewDir : TEXCOORD1;
+};
+
+struct app2vertStencilCull
+{
+    IN_P
+    IN_TBASE
+    IN_C0
+};
+
+struct vert2fragStencilCull
+{
+    float4 HPosition : POSITION;
+};
+
+struct pixout_StencilCull
+{
+    half4 Color : COLOR0;
+};
+
+struct vert2fragShadowDeferredProj
+{
+    float4 HPosition : POSITION;
+    float4 ViewPos	 : TEXCOORD0;
+    float4 ViewVect	 : TEXCOORD1;
+    float4 ScreenTC	 : TEXCOORD2;
+};
+
+struct vert2fragShadowDeferred
+{
+    float4 HPosition            : POSITION;
+    float4 ViewPosLS_ViewVectLS	: TEXCOORD0;
+    float4 ScreenTC             : TEXCOORD1;
+#if %_RT_SAMPLE2
+    float3 WS_ViewVect          : TEXCOORD4;
+#endif
+};
+
+struct fragInShadowDeferred
+{
+    //order should be the  same as ouyput from vert2frag for dx10 
+    float4 WPos	                : SV_POSITION;
+    float4 ViewPosLS_ViewVectLS	: TEXCOORD0;
+    float4 ScreenTC             : TEXCOORD1;
+#if %_RT_SAMPLE2
+    float3 WS_ViewVect          : TEXCOORD4;
+#endif
+};
+
+struct vert2fragDeferred
+{
+    float4 HPosition   : POSITION;
+    float2 ScreenTC    : TEXCOORD0;
+    float3 WS_ViewVect : TEXCOORD1;
+};
+
+struct v2fShadowSimple
+{
+    float4 Position : POSITION;
+    float4 vScrPos  : TEXCOORDN;  
+};
+
+struct vert2fragFrustClip
+{
+    float4 HPosition : POSITION;
+    float4 ViewPos   : TEXCOORD0;
+    float4 ViewVect  : TEXCOORD1;
+    float2 ScreenTC  : TEXCOORD3;
+};
+
+struct fragInFrustClip
+{
+    float4 WPos     : SV_POSITION;
+    float4 ViewPos  : TEXCOORD0;
+    float4 ViewVect : TEXCOORD1;
+    float2 ScreenTC : TEXCOORD3;
+};
+
+//--------------------------------------------------------------------------------------------------
+// Stencil tagging / frustum clipping shaders. TODO: Distill these shaders to the minimum set.
+//--------------------------------------------------------------------------------------------------
+
+v2fShadowSimple TexturedQuadVS(app2vertStencilCull IN)
+{
+    v2fShadowSimple OUT = (v2fShadowSimple)0; 
+
+    // Position in screen space.
+    float4 vPos = IN.Position;
+    OUT.Position = float4(2.0f * (vPos.xy + 0.5f) / PerView_ScreenSize.xy - 1.0f, vPos.zw);
+
+    // output texture coordinates
+    OUT.vScrPos.xy = IN.baseTC.xy; // + PixelOffset.xy * 0.5
+    return OUT;
+}
+
+vert2fragStencilCull SimpleQuadVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+
+    // Position in screen space.
+    float4 vPos = IN.Position;
+    OUT.HPosition = float4(2.0f * (vPos.xy + 0.5f) / PerView_ScreenSize.xy - 1.0f, vPos.zw);
+
+    // output texture coordinates
+    //OUT.baseTC.xy = IN.baseTC.xy + PixelOffset.xy * 0.5;
+
+    return OUT;
+}
+
+vert2fragStencilCull SimpleQuadVS01(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+
+    // Position in screen space.
+    float4 vPos = IN.Position;
+    OUT.HPosition = float4(2.0f * vPos.xy - 1.0f, vPos.zw);
+
+    return OUT;
+}
+
+vert2fragStencilCull HiStencilRefreshVS(app2vertShadow IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+
+    float4 vPos = IN.Position;
+    OUT.HPosition = mul(CompMatrix, vPos);
+
+    return OUT;
+}
+
+vert2fragStencilCull StencilCullVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+
+    float4 vPos = IN.Position;
+    OUT.HPosition = mul(CompMatrix, vPos);
+
+#if %ST_NO_DEPTH_CLIPPING
+    OUT.HPosition.z = ClampToFarPlane(OUT.HPosition.z, OUT.HPosition.w);
+#endif
+    return OUT;
+}
+
+vert2fragStencilCull StencilCullFrontfaceVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+
+    float4 vPos = IN.Position;
+    OUT.HPosition = mul(CompMatrix, vPos);
+    return OUT;
+}
+float4 GetStencilVolumePos(app2vertStencilCull IN)
+{
+    float4 vPos = IN.Position;
+    //unprojection
+    vPos = mul(TexGen0, vPos);
+
+    //normalization
+    vPos /= vPos.w;
+    vPos.w = 1.0f;
+
+    //sphere adjusting
+
+    //float4 LSPos = float4(397,373,74.39, 50);
+    float3 vLightDir = normalize(vPos.xyz - LSPos.xyz);
+    vLightDir *= LSPos.w; //radius multiplication;
+
+    // select proper vector: baseTC.x is 0 for the pyramid tip only, 1 otherwise
+    vPos.xyz = IN.baseTC.x > 0 ? (LSPos.xyz + vLightDir) : LSPos.xyz; 
+    return vPos;
+}
+
+vert2fragStencilCull FrustumVolumeVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+    //final ViewProj transformation
+    OUT.HPosition = mul(CompMatrix, GetStencilVolumePos(IN));
+    
+#if %ST_NO_DEPTH_CLIPPING
+    OUT.HPosition.z = ClampToFarPlane(OUT.HPosition.z, OUT.HPosition.w);
+#endif
+    return OUT;
+}
+
+vert2fragStencilCull FrustumVolumeFrontfaceVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0; 
+    //final ViewProj transformation
+    OUT.HPosition = mul(CompMatrix, GetStencilVolumePos(IN));
+    return OUT;
+}
+pixout_StencilCull StencilCullPS(vert2fragStencilCull IN)
+{
+    pixout_StencilCull OUT = (pixout_StencilCull) 1;
+
+    OUT.Color = half4(1,1,1,1);
+
+    return OUT;
+}
+
+#if GMEM
+// StencilCullGmemPS pixel shader is used in CD3D9Renderer::FX_StencilCullNonConvex()
+// It's mimicking the Non-Gmem path depth and stencil operations, which are the following:
+//    1) Set Depth test function set to LessEqual
+//    2) Set Stencil test function set to GreaterEqual
+//    3) Stencil operations to do:
+//          Stencil test fails: Keep current stencil value
+//          Stencil test passes and Depth Fails: replace or invert
+//          Stencil and Depth tests pass: Keep current stencil Value
+// Basically it is modifying the stencil only when 'Stencil passes and Depth fails'.
+//
+// With Gmem the stencil values are written out to a texture, so to mimic the previous behaviour we
+// have to do the stencil operations when depth test passes. To contrarest this it will use the opposite
+// depth function.
+//    1) Set Depth test function to Greater. This is the same as saying "only do something when LessEqual fails".
+//    2) Operations to do in the shader:
+//          Stencil GreaterEqual is true (passes): replace or invert
+//          Stencil GreaterEqual is false (fails): Keep current stencil value
+//
+// The stencil reference value is stored in StencilRef.x
+// The specific stencil operation to do is determined by the value stored in StencilRef.y: 0 means replace, 1 means invert
+float4 StencilRef; 
+pixout_gbuffer StencilCullGmemPS(vert2fragStencilCull IN)
+{
+    pixout_gbuffer OUT;
+
+    uint curStencilVal = GMEM_LinDepthResSten.Load(int3(0,0,0)).y;
+
+    const uint READ_WRITE_STENCIL_MASK = 0x0000007F;
+
+    uint stencilRefValMasked = (uint)(StencilRef.x) & READ_WRITE_STENCIL_MASK;
+    uint curStencilValMasked = curStencilVal & READ_WRITE_STENCIL_MASK;
+
+    // Stencil GreaterEqual passes
+    if (stencilRefValMasked >= curStencilValMasked)
+    {
+        if (StencilRef.y != 0)
+        {
+            // Invert stencil value
+            OUT.LinDepthResSten.y = (curStencilVal & ~READ_WRITE_STENCIL_MASK) | ((~curStencilValMasked) & READ_WRITE_STENCIL_MASK);
+        }
+        else
+        {
+            // Replace stencil value with reference value
+            OUT.LinDepthResSten.y = (curStencilVal & ~READ_WRITE_STENCIL_MASK) | stencilRefValMasked;
+        }    
+    }
+    // Stencil GreaterEqual fails
+    else
+    {
+        // Keep same value
+        OUT.LinDepthResSten.y = curStencilVal;
+    }
+
+    return OUT;
+}
+#endif
+
+// .x is the stencil ref
+float4 StencilRefResolve;
+float4 StencilCullResolvePS(vert2fragStencilCull IN) : SV_Target0
+{
+    return StencilRefResolve;
+}
+
+vert2fragShadowDeferred DeferredShadowVS(app2vertShadow IN)
+{
+    vert2fragShadowDeferred OUT = (vert2fragShadowDeferred)0; 
+
+    OUT.HPosition = Get2dHPos(IN.Position);
+    OUT.ScreenTC.xy = IN.baseTC.xy;
+    OUT.ScreenTC.zw = OUT.ScreenTC.xy * PerView_ScreenSize.xy / 4.0;
+
+    #if %_RT_SAMPLE2
+    OUT.WS_ViewVect = IN.viewDir.xyz;
+    #endif
+
+    // noise projection
+    float3 ViewPosLS = mul(PerView_WorldViewPos.xyz, (float3x3)RotMatrix);
+    OUT.ViewPosLS_ViewVectLS.xy = ViewPosLS.xy;
+    OUT.ViewPosLS_ViewVectLS.zw = (mul((PerView_WorldViewPos.xyz + IN.viewDir.xyz), (float3x3)RotMatrix) - ViewPosLS.xyz).xy;
+
+    return OUT;
+}
+
+pixout_cl_depth CopyDepthTarget(v2fShadowSimple IN)
+{
+    pixout_cl_depth OUT = (pixout_cl_depth) 1;
+
+    // Get device depth taking into account nearest depth scaling
+    float fSceneDepth = GetDepthMap(sceneDepthTexture, IN.vScrPos.xy).r;
+    float fNearestScaledLinear = PerView_ProjRatio.y / (PerView_NearestScaled.z - PerView_ProjRatio.x);
+    float2 ProjRatio = (fSceneDepth < fNearestScaledLinear) ? PerView_NearestScaled.xy : PerView_ProjRatio.xy;
+    float fDevDepth = ProjRatio.x + ProjRatio.y / fSceneDepth;
+
+    OUT.Depth = fDevDepth;
+
+    return OUT;
+}
+
+float4x4 g_mReprojDstToSrc;
+float4x4 g_mReprojSrcToDst;
+
+pixout_cl_depth ReprojectShadowMap(vtxOut IN)
+{
+    pixout_cl_depth OUT = (pixout_cl_depth) 1;
+    float4 clipPosDst = float4(IN.baseTC.xy * float2(2, -2) - float2(1, -1), 0, 1);
+    
+    float4 clipPosSrc =  mul(clipPosDst, g_mReprojDstToSrc);
+    clipPosSrc.xy /= clipPosSrc.w;
+    
+    float2 tcSrc = clipPosSrc.xy * float2(0.5, -0.5) + 0.5;
+    float srcDepth = tex2D(_tex0, tcSrc);
+    clipPosDst.zw = mul(float4(clipPosSrc.xy, srcDepth, 1.0f), g_mReprojSrcToDst).zw;
+    float dstDepth = clipPosDst.z / clipPosDst.w;
+    
+    if (tcSrc.x >=0 && tcSrc.x <= 1 && tcSrc.y >= 0 && tcSrc.y <= 1 && srcDepth < 1)
+        OUT.Depth = saturate(dstDepth);
+
+    return OUT;
+}
+
+float4 FrustumClipVolume(float4 vPos)
+{
+#if %_RT_SAMPLE3
+    float4x4 blendMat = float4x4(BlendInfo.x, 0.0, 0.0, 0.0,  // ignoring z-blend for now
+    0.0, BlendInfo.x, 0.0, 0.0,
+    0.0, 0.0,         1.0, 0.0,
+    0.0, 0.0,         0.0, 1.0);
+
+    blendMat = mul(TexGen0, blendMat);
+    vPos = mul(blendMat, vPos);
+#else
+    vPos = mul(TexGen0, vPos);
+#endif
+
+    //normalization
+    vPos.xyz /= vPos.w;
+    vPos.w = 1.0f;
+
+    //final ViewProj transformation
+    return mul(CompMatrix, vPos);
+}
+
+vert2fragStencilCull FrustumClipVolumeVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0;
+    OUT.HPosition = FrustumClipVolume(IN.Position);
+
+#if %ST_NO_DEPTH_CLIPPING
+    OUT.HPosition.z = ClampToFarPlane(OUT.HPosition.z, OUT.HPosition.w);
+#endif
+    return OUT;
+}
+
+vert2fragStencilCull FrustumClipVolumeFrontfaceVS(app2vertStencilCull IN)
+{
+    vert2fragStencilCull OUT = (vert2fragStencilCull)0;
+    OUT.HPosition = FrustumClipVolume(IN.Position);
+    return OUT;
+}
+
+pixout_StencilCull FrustumClipVolumePS(vert2fragStencilCull IN)
+{
+    pixout_StencilCull OUT = (pixout_StencilCull)1;
+
+    OUT.Color = half4(1.0, 1, 1, 1);
+
+    return OUT;
+}
+
+vert2fragFrustClip FrustumClipVS(app2vertShadow IN)
+{
+    vert2fragFrustClip OUT = (vert2fragFrustClip)0;
+
+    float4 vPos = IN.Position;
+
+    OUT.HPosition = mul(CompMatrix, vPos);
+
+    // ViewPos and ViewVect in projective space
+    ShadowTexSpace(float4(PerView_WorldViewPos.xyz, 1), TexGen0, fOneDivFarDist.x, OUT.ViewPos);
+    ShadowTexSpace(float4(PerView_WorldViewPos.xyz + IN.viewDir.xyz, 1), TexGen0, fOneDivFarDist.x, OUT.ViewVect);
+
+    OUT.ViewVect -= OUT.ViewPos;
+    OUT.ScreenTC.xy = IN.baseTC.xy;
+
+    return OUT;
+}
+
+pixout_cl FrustumClipPS(fragInFrustClip IN)
+{
+    pixout_cl OUT;
+
+    OUT.Color = half4(0, 0, 0, 0);
+
+    float SceneDepth = GetLinearDepth(sceneDepthTexture, IN.ScreenTC.xy);
+
+    //simplified shadow tex space reconstruction
+    float4 P0 = IN.ViewPos + IN.ViewVect * SceneDepth;
+    //float4  P0 = CalcHomogeneousPos(SceneDepth, IN.WPos.xy/*+ScreenSpaceOffset[0].xy*/);
+    P0.xy /= P0.w;
+
+    float4 clipFrustum;
+    clipFrustum.xy = P0.xy;
+    clipFrustum.zw = 1.0 - P0.xy;
+
+    clip(clipFrustum);
+
+    // no color writes enable - cg generating 1 empty cycle (we can save it by not outputting color)
+    //OUT.Color = clipFrustum;
+
+    return OUT;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Helper functions.
+//--------------------------------------------------------------------------------------------------
+
+float4 CalcHomogeneousPos(float SceneDepth, float2 WPos)
+{
+    // Separate scale to make sure we don't lose the precision during "mad"'s of WBasis vectors.
+    float4 vWBasisScale = vBasisMagnitudes * SceneDepth;
+    vWBasisScale.xy *= WPos.xy;
+
+    float4 HPos = vWBasisZ.xyzw * vWBasisScale.z + (vWBasisX.xyzw * vWBasisScale.x) + (vWBasisY.xyzw * vWBasisScale.y);
+    HPos = vCamPos.xyzw + HPos.xyzw;
+
+    return HPos;
+}
+
+float4 CalcHomogeneousBlendPos(float SceneDepth, float2 WPos)
+{
+    float4 pPos = float4(float3(WPos.xy, 1.0) * SceneDepth, 1.0);
+    float4 HPos = mul(BlendTexGen , pPos);
+
+    HPos.xy /= HPos.w;
+
+    return HPos;
+}
+
+float BlendVP(float3 vp, bool blendOut)
+{
+    float3 vBlend;
+    float2 BlendVal = (blendOut) ? BlendInfo.xy : BlendInfo.zw;
+
+##if AZ_RESTRICTED_PLATFORM
+    ##define AZ_RESTRICTED_SECTION 1
+    ##include_restricted(ShadowMaskGen_cfx, AZ_RESTRICTED_PLATFORM)
+##endif
+##if AZ_RESTRICTED_SECTION_IMPLEMENTED
+    ##undef AZ_RESTRICTED_SECTION_IMPLEMENTED
+##else
+    vBlend.xy = saturate(abs(vp.xy * 2.0 - 1.0));
+##endif
+
+    vBlend.xy -= BlendVal.x;
+    vBlend.xy *= BlendVal.y;
+
+    float fBlendValZ = 0.975;  // Magic number
+
+    vBlend.z = vp.z * fOneDivFarDist.x;
+    vBlend.z -= fBlendValZ;
+    vBlend.z *= 1.0 / (1.0 - fBlendValZ);
+
+    float result = saturate(max(max(vBlend.x, vBlend.y), vBlend.z));
+
+    return (blendOut) ? (1.0 - result) : result;
+}
+
+float4 CalcShadowSpace(in float4 in_clipPos)
+{
+    float4 shadowPos = in_clipPos;
+    shadowPos.xy /= shadowPos.w;
+
+#if !%_RT_NEAREST
+    // TODO: Concatenate this operations to the projection matrix.
+    shadowPos.z *= fOneDivFarDist.x;
+#endif
+
+    // Slope-scale bias is done only during shadow map generation; constant bias for the sun.
+    shadowPos.z -= fDepthTestBias.x;
+
+    return shadowPos;
+}
+
+half CalcShadow(in float4 in_shadowPos, in float2 in_noisePos, const bool bContactHardening)
+{
+#if %_RT_SHADOW_MIXED_MAP_G16R16
+    // Clamp depth in shadows space for all FP shadow maps as the comparison sampler
+    // doesn't do clamping internally for FP formats.
+    in_shadowPos.z = clamp(in_shadowPos.z, 0.0f, 0.999999f);
+#endif
+
+    // Compute the shadow factor.
+    half fShadow = 1.0;
+
+#if %_RT_SHADOW_JITTERING
+    ##if AZ_RESTRICTED_PLATFORM
+        ##define AZ_RESTRICTED_SECTION 2
+        ##include_restricted(ShadowMaskGen_cfx, AZ_RESTRICTED_PLATFORM)
+    ##endif
+    ##if AZ_RESTRICTED_SECTION_IMPLEMENTED
+        ##undef AZ_RESTRICTED_SECTION_IMPLEMENTED
+    ##else
+        #if IOSMETAL || OSXMETAL || GLES3
+            fShadow = ShadowResolve_3x3PCF(depthMapSampler0, in_shadowPos.xyz, vInvShadowMapSize.x);
+        #else
+            // Noise-projection scale should be computed based on the size of the shadow frustum
+            // (increase if bigger) and distance to viewer (decrease if farther).
+            // irregular_filter(depthMapSampler0, sRotSampler, in_shadowPos, in_noisePos, GetKernelSize(), fShadow, bContactHardening);
+            fShadow = ShadowResolve_7x7PCF(depthMapSampler0, in_shadowPos.xyz, vInvShadowMapSize.x);
+        #endif
+    ##endif
+#else
+    // Simple one-tap sampling.
+    shadow_sample(depthMapSampler0, in_shadowPos.xyz, fShadow);
+#endif
+
+    return fShadow;
+}
+
+float GetSceneDepthMS(float3 iScreenCoord, int iSample)
+{
+    return sceneDepthTextureMS.Load(iScreenCoord, iSample).x;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Shadow resolve pixel shaders.
+//--------------------------------------------------------------------------------------------------
+
+#if %ST_GMEM_PLS
+void DeferredShadowGmemPS(fragInShadowDeferred IN)
+#else
+pixout_gmem DeferredShadowGmemPS(fragInShadowDeferred IN)
+#endif
+{
+    pixout_gmem OUT;
+
+    float4 P0 = 0.0f;
+
+    // Todo: bilateral upscale pass. Measure performance vs rendering shadows to multisampled target+sample freq passes
+    float SceneDepth = GmemGetLinearDepth( sceneDepthTexture, IN.ScreenTC.xy, false );	
+    
+    P0 = CalcHomogeneousPos(SceneDepth, IN.WPos.xy);
+
+    float4 pOutBlend = float4(P0.xy / P0.w, P0.zw);
+
+    P0 = CalcShadowSpace(P0);
+
+#if %_RT_SAMPLE1
+    const bool bContactHardening = true;
+#else
+    const bool bContactHardening = false;
+#endif
+
+    float2 NoiseP = IN.ViewPosLS_ViewVectLS.xy + IN.ViewPosLS_ViewVectLS.zw * SceneDepth;
+    half fInShadow = CalcShadow(P0, NoiseP, bContactHardening);
+
+    //gsm fading
+    half2 fDist = 2.0*abs(P0.xy-half2(0.5,0.5));
+    half fFadeF = 1.0 - (fShadowFadingDist.x * pow(max(fDist.x,fDist.y),8));
+
+    half outValue = 1.0 - fInShadow;
+
+    // Apply POM self-shadowing (NOT YET AVAILABLE IN GMEM)
+    // uint2 pixelCoord = int2(IN.ScreenTC.xy * PS_ScreenSize.xy);
+    // outValue = 1 - fInShadow * (1 - DecodeSunSelfShadowing(sceneGBufferA[pixelCoord], sceneGBufferB[pixelCoord], sceneGBufferC[pixelCoord]));
+
+    outValue *= saturate(fFadeF);
+
+    if(BlendTexGen[3][3] != 0)// blend inwards
+    {
+        float4 pBlendVP = CalcHomogeneousBlendPos(SceneDepth, IN.WPos.xy);
+        outValue *=  BlendVP(pBlendVP.xyz, false);
+    }
+            
+#if %_RT_SAMPLE3 // Outward Blend. Round nearest (opposite to blend inwards)
+    float fBlend = BlendVP(pOutBlend.xyz, true);
+    fBlend += 0.5f / 255.0f;
+    outValue *= fBlend;
+#endif
+
+  if (outValue > 0.f)
+  {
+#if !%ST_GMEM_PLS
+    OUT.LightDiffuse.a = outValue;
+#else
+        GMEM_PLS_LightBuffers[0].lightDiffuse_zw.y = outValue;
+#endif
+  }
+
+#if !%ST_GMEM_PLS	
+  return OUT;
+#endif
+}
+
+EARLYDEPTHSTENCIL
+pixout_cl DeferredShadowPS(fragInShadowDeferred IN)
+{
+  pixout_cl OUT;
+
+  float4 P0 = 0.0f;
+
+    // Todo: bilateral upscale pass. Measure performance vs rendering shadows to multisampled target+sample freq passes
+
+    //	Igor: the original code produces incorrect rendering results on Android when OSM is on.
+    //	It is not clear why depth and g-buffer(please, see below) were configured to be read differently.
+    //	This might be just a result from remaining legacy code.
+    //	Since depth buffer and g-buffer have the same resolution, reading both uniformly solves the issue
+    //	and allows to make the code more uniform.
+    //	If for some reason reduced resolution depth will be used instead the code needs to be re-adjusted.
+    //float SceneDepth = GetLinearDepth( sceneDepthTexture, IN.ScreenTC.xy );
+    uint2 pixelCoord = int2(IN.ScreenTC.xy * PS_ScreenSize.xy);
+    float SceneDepth = GetLinearDepth( sceneDepthTexture, pixelCoord );
+
+  P0 = CalcHomogeneousPos(SceneDepth, IN.WPos.xy);
+
+  float4 pOutBlend = float4(P0.xy / P0.w, P0.zw);
+  pOutBlend.xy = pOutBlend.xy * BlendTcNormalize.xy + BlendTcNormalize.zw;
+  
+  P0 = CalcShadowSpace(P0);
+
+#if %_RT_SAMPLE1
+    const bool bContactHardening = true;
+#else
+    const bool bContactHardening = false;
+#endif
+
+  float2 NoiseP = IN.ViewPosLS_ViewVectLS.xy + IN.ViewPosLS_ViewVectLS.zw * SceneDepth;
+  half fInShadow = CalcShadow(P0, NoiseP, bContactHardening);
+
+  //gsm fading
+    half2 fDist = 2.0*abs(P0.xy-half2(0.5,0.5));
+  half fFadeF = 1.0 - (fShadowFadingDist.x * pow(max(fDist.x,fDist.y),8));
+
+#if %_RT_SAMPLE2
+    // Apply sun SS shadows
+    float3 WorldP = PerView_WorldViewPos.xyz + IN.WS_ViewVect * SceneDepth;
+    CalculateDetailSSShadow(SceneDepth, WorldP, WorldP + PerFrame_SunDirection.xyz, CompMatrix, fInShadow, true);
+#endif
+
+    // Apply POM self-shadowing
+    OUT.Color = 1 - fInShadow * (1 - DecodeSunSelfShadowing(sceneGBufferA[pixelCoord], sceneGBufferB[pixelCoord], sceneGBufferC[pixelCoord]));
+    
+    OUT.Color *= saturate(fFadeF);
+
+    if(BlendTexGen[3][3] != 0)// blend inwards
+    {
+        float4 pBlendVP = CalcHomogeneousBlendPos(SceneDepth, IN.WPos.xy);
+        OUT.Color *= BlendVP(pBlendVP.xyz, false);
+    }
+
+#if %_RT_SAMPLE3 // Outward Blend. Round nearest (opposite to blend inwards)
+    float fBlend = BlendVP(pOutBlend.xyz, true);
+    fBlend += 0.5f / 255.0f;
+    OUT.Color *= fBlend;
+#endif
+
+    return OUT;
+}
+
+pixout_gmem CloudsShadowGmemPS(fragInShadowDeferred IN)
+{
+    // Note we must do our own blending in gmem since shadow values are encoded
+    // Blending: out = MAX(src, dst)
+
+    pixout_gmem OUT;
+    uint uOutVal = 255;
+
+#if %_RT_SAMPLE2
+    float SceneDepth = GmemGetLinearDepth( sceneDepthTexture, IN.ScreenTC.xy, false );
+    float3 WorldP = PerView_WorldViewPos.xyz + IN.WS_ViewVect * SceneDepth.x;
+    float CloudShadow = 1-GetCloudShadow(WorldP);
+    uOutVal = clamp(CloudShadow*255, 0, 127);
+#endif
+
+    float curShadowVal = GMEM_LightDiffuse.Load(int3(0,0,0)).a;
+    uOutVal = max(uOutVal, curShadowVal);
+
+    OUT.LightDiffuse.a = uOutVal;
+
+    return OUT;
+}
+
+pixout_cl CloudsShadowPS(fragInShadowDeferred IN)
+{
+  pixout_cl OUT = (pixout_cl) 1;
+
+#if %_RT_SAMPLE2
+    float SceneDepth = GetLinearDepth( sceneDepthTexture, IN.ScreenTC.xy );
+    float3 WorldP = PerView_WorldViewPos.xyz + IN.WS_ViewVect * SceneDepth;
+    OUT.Color = 1-GetCloudShadow(WorldP);
+#endif
+
+    return OUT;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Debug shaders.
+//--------------------------------------------------------------------------------------------------
+
+samplerCUBE DebugCM : register(s0);
+sampler2D DebugSM   : register(s0);
+
+struct app2vertDebug
+{
+    IN_P
+    float3 vIdxCoord	: TEXCOORDN;  
+};
+
+struct v2fDebug
+{
+    float4 Position 	: POSITION;
+    float3 vIdxCoord	: TEXCOORDN;  
+};
+
+v2fDebug DebugCMVS(app2vertDebug IN)
+{
+    v2fDebug OUT;
+    OUT.Position = mul(vpMatrix, IN.Position);
+    OUT.vIdxCoord = IN.vIdxCoord;
+    return OUT;
+}
+
+pixout_cl DebugCMPS(v2fDebug IN)
+{
+    pixout_cl OUT;
+
+    OUT.Color.xyz = texCUBE(DebugCM, IN.vIdxCoord).x;
+    OUT.Color.w = 1.0f;
+
+    return OUT;			
+}
+
+pixout_cl DebugSMPS(v2fDebug IN)
+{
+    pixout_cl OUT;
+
+    OUT.Color.xyz = (1.0f - tex2D(DebugSM, IN.vIdxCoord.xy).x);
+    OUT.Color.w = 1.0f;
+
+    return OUT;			
+}
+
+float4 DebugShadowCascadesVS(float4 inPosition : POSITION) : POSITION
+{
+    float4 vPos = inPosition;
+    vPos.y = 1 - vPos.y;
+    return float4(vPos.xy * 2 - 1, vPos.z, 1.0);
+}
+
+pixout_cl DebugShadowCascadesPS(float4 inPosition : SV_Position)
+{
+    pixout_cl OUT;
+    OUT.Color.rgb = DebugCascadeColor.rgb;
+    OUT.Color.w = 1.0f;
+
+    return OUT;			
+}
+
+//--------------------------------------------------------------------------------------------------
+// Techniques.
+//--------------------------------------------------------------------------------------------------
+
+technique DebugCubeMap
+{
+    pass p0
+    {
+        VertexShader = DebugCMVS();
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = DebugCMPS();
+    }
+}
+
+technique DebugShadowMap
+{
+    pass p0
+    {
+        VertexShader = DebugCMVS();
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = DebugSMPS();
+    }
+}
+
+technique DebugShadowCascades
+{
+    pass p0
+    {
+        VertexShader = DebugShadowCascadesVS();
+        
+        ZEnable = false;
+        ZWriteEnable = false;
+        
+        PixelShader = DebugShadowCascadesPS();
+    }
+}
+
+technique DeferredShadowPass
+{
+    //Stencil Pre-pass
+    pass p0
+    {
+        VertexShader = FrustumClipVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = FrustumClipPS() ShadowMaskGenPS;
+    }
+
+    //Hi-stencil refresh pass
+    pass p1
+    {
+        VertexShader = HiStencilRefreshVS() ShadowMaskGenVS;
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+    }
+
+    //Shadow pass
+    pass p2
+    {
+        VertexShader = DeferredShadowVS() ShadowMaskGenVS;
+    #if GMEM
+        PixelShader = DeferredShadowGmemPS() ShadowMaskGenPS;
+    #else
+        PixelShader = DeferredShadowPS() ShadowMaskGenPS;
+    #endif
+
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+    }
+  
+    //StencilCull pass for point light sources
+    pass p3
+    {
+        VertexShader = StencilCullVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+
+    //StencilCull pass for point light sources
+    pass p4
+    {
+        VertexShader = FrustumVolumeVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+
+    //Stencil Pre-pass
+    pass p5
+    {
+        VertexShader = FrustumClipVolumeVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = FrustumClipVolumePS() ShadowMaskGenPS;
+    }
+
+    //Clouds shadows
+    pass p6
+    {
+
+        VertexShader = DeferredShadowVS() ShadowMaskGenVS;
+    #if GMEM
+        PixelShader = CloudsShadowGmemPS() ShadowMaskGenPS;
+    #else
+        PixelShader = CloudsShadowPS() ShadowMaskGenPS;
+    #endif
+
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+    }
+
+    pass p7
+    {
+        VertexShader = FrustumClipVolumeVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+    #if GMEM
+        PixelShader = DeferredShadowGmemPS() ShadowMaskGenPS;
+    #else
+        PixelShader = DeferredShadowPS() ShadowMaskGenPS;
+    #endif
+    }
+
+#if GMEM
+    // Stencil Cull Non Convex for GMEM VisAreas using r_VisAreaClipLightsPerPixel=1.
+    // We do our own stencil logic in the pixel shader.
+    // Note this might be costly depending on the scene!
+    pass p8
+    {
+        VertexShader = StencilCullVS() ShadowMaskGenVS;
+
+        ZWriteEnable = false;
+        CullMode = Back;
+
+        PixelShader = StencilCullGmemPS() ShadowMaskGenPS;
+    }
+#else
+    //	Igor: need at least one shader here since otherwise the next pass index will be 8
+    //	Just copy of p5. Make some states look different.
+    pass p8
+    {
+        VertexShader = FrustumClipVolumeVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = FrustumClipVolumePS() ShadowMaskGenPS;
+    }
+#endif
+
+    // Stencil Cull Non Convex for VisAreas when stencil textures
+    // are not supported.
+    pass p9
+    {
+        VertexShader = StencilCullVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+
+        PixelShader = StencilCullResolvePS() ShadowMaskGenPS;
+    }
+
+    //StencilCull for front facing triangles pass for light sources
+    //This pass is used for devices that dont have depthClipping support
+    pass p10
+    {
+        VertexShader = StencilCullFrontfaceVS() ShadowMaskGenVS;
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+
+    //StencilCull pass for front facing triangles for light sources
+    //This pass is used for devices that dont have depthClipping support
+    pass p11
+    {
+        VertexShader = FrustumVolumeFrontfaceVS() ShadowMaskGenVS;
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+
+    //StencilCull pass for front facing triangles for light sources
+    //This pass is used for devices that dont have depthClipping support
+    pass p12
+    {
+        VertexShader = FrustumClipVolumeFrontfaceVS() ShadowMaskGenVS;
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = Back;
+        PixelShader = FrustumClipVolumePS() ShadowMaskGenPS;
+    }
+
+}
+
+technique DeferredSimpleQuad
+{
+    //Stencil Pre-pass
+    pass p0
+    {
+        VertexShader = SimpleQuadVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+}
+
+technique DeferredSimpleQuad01
+{
+    //Stencil Pre-pass
+    pass p0
+    {
+        VertexShader = SimpleQuadVS01() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+}
+
+technique StencilVolume
+{
+    pass p0
+    {
+        VertexShader = StencilCullVS() ShadowMaskGenVS;
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+
+        PixelShader = StencilCullPS() ShadowMaskGenPS;
+    }
+}
+
+technique ResolveDepthTarget
+{
+    //Stencil Pre-pass
+    pass p0
+    {
+        VertexShader = TexturedQuadVS();
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = CopyDepthTarget();
+    }
+}
+
+technique ReprojectShadowMap
+{
+    pass p0
+    {
+        VertexShader = BaseVS();
+    
+        ZEnable = false;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        PixelShader = ReprojectShadowMap();
+    }
+}

@@ -1,0 +1,659 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "ModificatorVT.cfi"
+#include "ModificatorTC.cfi"
+
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "Public;"
+           "NoPreview;"           
+           "ShaderDrawType = General;"                      
+           "ShaderType = FX;"
+>;
+
+float DissolveFunction(float2 screenPos, float dissolveFactor)
+{
+     const int2 vPixQuadIdx = (int2)screenPos % 2; // 4 transparency levels for a 2x2 quad. We're using dot/abs instead, since rsx doens't support array indexing. 
+     return (abs(dot(half4(0.0h, 0.76h, 0.5h, -1.0h), vPixQuadIdx.xxyy)) - dissolveFactor); // todo: try using coverage mask when in MSAA mode.
+}
+
+/// Un-Tweakables //////////////////////
+float2 ScrSize : PB_ScreenSize;
+
+ENVIRONMENTMAP
+ENVIRONMENTCUBEMAP
+
+sampler2D glowDecalMapSampler = sampler_state 
+{ 
+  Texture = $DecalOverlay; 
+};
+
+sampler2D diffuseLinearSampler = sampler_state 
+{ 
+  Texture = $Diffuse; 
+  sRGBLookup = true;
+};
+
+sampler2D deformMapSampler
+{
+  Texture = EngineAssets/Textures/perlinNoiseNormal_ddn.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+sampler2D noiseMap
+{
+  Texture = EngineAssets/ScreenSpace/grain_bayer_mul.tif;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = NONE; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+sampler2D pixelMapSampler = sampler_state 
+{ 
+  Texture = EngineAssets/Textures/pixeltex.dds; 
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR; 
+  AddressU = Wrap;
+  AddressV = Wrap;	
+};
+
+// Tweakables /////////////////
+
+float DeformAmount
+<  
+  register = PER_MATERIAL_0.x;
+  string UIName = "Deform amount"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.1;
+> = 0.0;
+
+float DeformTillingX // @TODO: Fix spelling when versioning is supported on material settings.
+<  
+  register = PER_MATERIAL_0.y;
+  string UIName = "Deform tiling X"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 128.0;
+  float UIStep = 0.1;
+> = 1.0;
+
+float DeformTillingY// @TODO: Fix spelling when versioning is supported on material settings.
+<  
+  register = PER_MATERIAL_0.z;
+  string UIName = "Deform tiling Y"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 128.0;
+  float UIStep = 0.1;
+> = 1.0;
+
+float DeformFreq
+<  
+  register = PER_MATERIAL_0.w;
+  string UIName = "Deform freq"; 
+  
+  string UIWidget = "slider";
+  float UIMin = -16.0;
+  float UIMax = 16.0;
+  float UIStep = 0.1;
+> = 0.0;
+
+float InterlacingAmount
+<  
+  register = PER_MATERIAL_1.x;
+  string UIName = "Interlacing amount"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.1;
+> = 0.0;
+
+float InterlacingTilling // @TODO: Fix spelling when versioning is supported on material settings.
+<  
+  register = PER_MATERIAL_1.y;
+  string UIName = "Interlacing tiling"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 16.0;
+  float UIStep = 0.1;
+> = 0.25;
+
+float VSyncFreq
+<  
+  register = PER_MATERIAL_1.z;
+  string UIName = "VSync freq"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 16.0;
+  float UIStep = 0.1;
+> = 0.0;
+
+float ChromaShift
+<  
+  register = PER_MATERIAL_1.w;
+  string UIName = "Chroma Shift"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.1;
+> = 0.0;
+
+half Contrast
+<
+  register = PER_MATERIAL_2.x;
+  string UIHelp = "Set display contrast";
+  string UIName = "Contrast";
+    
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 25.0;
+  float UIStep = 0.1;
+> = 1.0;
+
+half Saturation
+<
+  register = PER_MATERIAL_2.y;
+  string UIHelp = "Set display saturation";
+  string UIName = "Saturation";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 25.0;
+  float UIStep = 0.1;
+> = 1.0;
+
+half ViewAngle
+<  
+  register = PER_MATERIAL_2.z;
+  string UIHelp = "Set display view angle";
+  string UIName = "View angle"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 180.0;
+  float UIStep = 5.0;
+> = 155.0;
+
+half PixelVisibility
+<  
+  register = PER_MATERIAL_2.w;
+  string UIName = "Pixel visibility";    
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.1;
+> = 0.5;
+
+half ResolutionX
+<  
+  register = PER_MATERIAL_3.x;
+  string UIName = "Display Width";    
+  
+  string UIWidget = "slider";
+  float UIMin = 8.0;
+  float UIMax = 2560.0;
+  float UIStep = 16.0;
+> = 512.0;
+
+half ResolutionY
+<  
+  register = PER_MATERIAL_3.y;
+  string UIName = "Display Height";    
+  
+  string UIWidget = "slider";
+  float UIMin = 8.0;
+  float UIMax = 2048.0;
+  float UIStep = 16.0;
+> = 512.0;
+
+half GrainAmount
+<  
+  register = PER_MATERIAL_3.z;
+  string UIName = "Grain amount"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 8.0;
+  float UIStep = 0.1;
+> = 0.1;
+
+half GrainTilling // @TODO: Fix spelling when versioning is supported on material settings.
+<  
+  register = PER_MATERIAL_3.w;
+  string UIName = "Grain tiling"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 16.0;
+  float UIStep = 0.1;
+> = 1.0;
+
+half GrainSaturation
+<  
+  register = PER_MATERIAL_4.x;
+  string UIName = "Grain saturation"; 
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.1;
+> = 1.0;
+
+// Fresnel parameters
+half FresnelScale
+<
+  register = PER_MATERIAL_4.y;
+  string UIWidget = "slider";
+  string UIName = "Fresnel Scale";
+  float UIMin = 0.0;
+  float UIMax = 32.0;
+  float UIStep = 0.01;
+> = 1.0;
+
+half FresnelBias
+<
+  register = PER_MATERIAL_4.z;
+  string UIWidget = "slider";
+  string UIName = "Fresnel Bias";  
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.001;
+> = 1;
+
+
+////////////////////////////////////////////////////////
+//                GENERAL PASS
+////////////////////////////////////////////////////////
+
+///////////////// vertex input/output //////////////////
+struct vtxOUT
+{
+    OUT_P
+
+    float4 baseTC    : TEXCOORDN;
+    float4 maskTC     : TEXCOORDN;
+    float4 screenProj : TEXCOORDN;
+
+    float4 vView     : TEXCOORDN;
+    float4 vNormal : TEXCOORDN;
+
+    #if %_RT_FOG
+        float4 AvgFogVolumeContrib : TEXCOORDN;
+    #endif
+};
+
+///////////////// vertex shader //////////////////
+vtxOUT MonitorVS(app2vertGeneral IN)
+{
+    vtxOUT OUT = (vtxOUT)0; 
+
+    // Position in screen space.
+    streamPos vertPassPos = (streamPos)0;
+    streamPos_FromGeneral(IN, vertPassPos);
+
+    OUT.HPosition = Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos);
+
+    float4 baseTC = vertPassPos.baseTC;
+    _ModifyUV_1(baseTC, OUT.baseTC, vertPassPos.Position );
+    OUT.maskTC.xyzw = mul(baseTC, _TCMMatrixEmissiveMultiplier);
+
+
+    float fAlphaRef = 0.01;
+
+    OUT.maskTC.z = saturate( fAlphaRef );
+    OUT.maskTC.w = GetInstance_Opacity(vertPassPos);
+
+    #if %VERTCOLORS
+        OUT.Color.xyz = vertPassPos.Color.xyz;
+        OUT.maskTC.w *= vertPassPos.Color.w;
+    #endif
+
+    // Output the screen-space texture coordinates
+    OUT.screenProj = HPosToScreenTC(OUT.HPosition);
+
+    // This is incorrect since we need to compensate for non-uniform scale, however the cost is not justified for this shader
+    // Look at CommonZPass.cfi for correct usage.
+    float3 worldTangentS = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]) );
+    float3 worldTangentT = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+    float3 worldTangentN = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2]) );
+    OUT.vNormal.xyz = worldTangentN;
+
+    OUT.vView.xyz = vertPassPos.WorldPos.xyz - PerView_WorldViewPos.xyz;
+
+    #if %_RT_FOG
+    #if !%_RT_VOLUMETRIC_FOG
+        //////////////////////////////////////////////////////////////////////////////////////////////////
+        // Output fog into view-vector W component (to save interpolator)
+        OUT.vView.w = GetVolumetricFogDensity(OUT.vView.xyz + PerView_WorldViewPos.xyz);
+
+        #if %_RT_INSTANCING_ATTR
+            #fetchinst (OUT.AvgFogVolumeContrib = IN.InstAvgFogVolumeContrib, vertPassPos.nInstance);  
+        #else
+            OUT.AvgFogVolumeContrib = AvgFogVolumeContrib[0];
+        #endif
+
+        #if !%_RT_ALPHABLEND
+            // additive blending case
+            OUT.AvgFogVolumeContrib.w *= OUT.vView.w;
+            OUT.AvgFogVolumeContrib.xyz = 0.0;
+        #endif
+        #else
+            OUT.AvgFogVolumeContrib = GetVolumetricFogAnalyticalColorByWorldPos(OUT.vView.xyz + PerView_WorldViewPos.xyz);
+        #endif
+    #else
+        OUT.vView.w = vertPassPos.Position.w;
+    #endif
+#if %_RT_DISSOLVE
+        OUT.baseTC.z = GetInstance_DissolveRef(vertPassPos).x;
+	// vNormal.w is available, let's store the clip factor of the dissolve mesh.
+        OUT.vNormal.w = GetInstance_DissolveRef(vertPassPos).y;
+#endif
+    return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+pixout MonitorPS(vtxOUT IN)
+{
+    pixout OUT;
+
+    // Debug output
+    #if %_RT_DEBUG0 || %_RT_DEBUG1 || %_RT_DEBUG2 || %_RT_DEBUG3
+        DebugOutput(OUT.Color, float4(IN.baseTC.xy, 0, 1));
+        return OUT;
+    #endif
+
+#if %_RT_DISSOLVE 
+        // vNormal.w contains the dissolveRef (1 or -1) of the dissolve mesh.
+    	clip(IN.vNormal.w * DissolveFunction(IN.HPosition.xy, IN.baseTC.z));
+#endif
+    // Apply deformation to uvs
+    float2 vDeformTC = GetNormalMap( deformMapSampler, IN.baseTC.xy * float2(DeformTillingX, DeformTillingY) + DeformFreq * PerView_AnimGenParams.x );
+    IN.baseTC.xy += vDeformTC * DeformAmount;
+    IN.maskTC.xy += vDeformTC * DeformAmount;
+
+    const half3 fLumVal = half3(0.33h, 0.59h, 0.11h);
+
+    half3 vView = normalize( -IN.vView.xyz );                                                           // 3 alu  
+    half3 vNormal = normalize( IN.vNormal.xyz );
+    half fNdotE = ( dot(vView.xyz, vNormal.xyz));                                        // 1 alu
+
+    half4 baseColor = 0;
+    #if %PIXELIZE
+        // Calculate pixelated coordinates.
+        const half2 fOneDivRes = 1.0h / half2(ResolutionX, ResolutionY);
+        half2 pixelatedTC = float2(fOneDivRes.x * floor(IN.baseTC.x * ResolutionX), fOneDivRes.y * floor(IN.baseTC.y * ResolutionY)); 
+      
+        // Fetch diffuse, apply chroma shift
+        baseColor   = GetTexture2D(diffuseMapSampler, (pixelatedTC.xy-0.5)*(1 + 0.1000 * ChromaShift) + 0.5);
+        baseColor.g = GetTexture2D(diffuseMapSampler, (pixelatedTC.xy-0.5)*(1 + 0.0500 * ChromaShift) + 0.5).g;
+        baseColor.b = GetTexture2D(diffuseMapSampler, (pixelatedTC.xy-0.5)*(1 + 0.0125 * ChromaShift) + 0.5).b;
+    #else
+        // Fetch diffuse, apply chroma shift
+        baseColor   = GetTexture2D(diffuseMapSampler, (IN.baseTC.xy-0.5)*(1 + 0.1000 * ChromaShift) + 0.5);
+        baseColor.g = GetTexture2D(diffuseMapSampler, (IN.baseTC.xy-0.5)*(1 + 0.0500 * ChromaShift) + 0.5).g;
+        baseColor.b = GetTexture2D(diffuseMapSampler, (IN.baseTC.xy-0.5)*(1 + 0.0125 * ChromaShift) + 0.5).b;
+    #endif
+
+    // Apply view angle color distortion.
+    const half fViewingAngle = ViewAngle * (PI / 180.0h);
+    half fViewFactor = saturate(pow(fNdotE, PI - fViewingAngle)); 
+    half fViewMask = saturate(dot(baseColor.xyz, 4.h)); // prevent flipping black colors
+    half3 cInvertColor = saturate(0.125 * fViewMask - baseColor.xyz) + baseColor.xyz * (0.5-fViewMask);
+    baseColor.xyz = lerp(cInvertColor, baseColor.xyz, fViewFactor);
+
+    half4 maskColor = GetTexture2D(glowDecalMapSampler, IN.maskTC.xy);  
+
+    half4 normalVec=half4(0,0,1,1);
+
+    // Apply mask
+    baseColor *= maskColor;
+
+    // Apply interlation
+    half fInterlation = (frac(IN.baseTC.y * 32* InterlacingTilling + VSyncFreq * PerView_AnimGenParams.x  ) > 0.5? 1.0 + InterlacingAmount:1.0 - InterlacingAmount);
+    baseColor *= fInterlation;
+
+    // Apply pixels.
+    const half pixelStrength = PixelVisibility * 10.0;
+    half fPixels = tex2D(pixelMapSampler, IN.baseTC.xy * half2(ResolutionX, ResolutionY)).r * pixelStrength + (1-pixelStrength);
+    baseColor.rgb *= saturate(fPixels);
+
+    // Apply grain
+    half4 cGrain = tex2D(noiseMap, (IN.baseTC.xy + PerFrame_RandomParams.xy) *GrainTilling );
+    baseColor.rgb *= 1.0 + lerp(dot(cGrain.rgb, 0.33), cGrain.rgb, GrainSaturation) * GrainAmount;
+
+    OUT.Color.xyz = GetMaterial_Emittance().rgb * baseColor.rgb;
+    OUT.Color.xyz *= (half3) PerMaterial_DiffuseColor;
+    OUT.Color.xyz = max( lerp(0.5, OUT.Color.xyz, Contrast), 0.0 );
+    OUT.Color.xyz = lerp(dot(OUT.Color.xyz, fLumVal), OUT.Color.xyz, Saturation);
+    OUT.Color.xyz *= baseColor.w * IN.maskTC.w;
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // Add specular support
+
+    half4 cSpecularAccRT = 0;
+    #if !%_RT_FOG
+        cSpecularAccRT = DecodeLightBuffer( tex2Dproj( sceneSpecularAccSampler, IN.screenProj.xyzw) , true); 
+    #endif
+
+    // Store some constant coeficients
+    half3 vReflVec = (2.0h * fNdotE * vNormal.xyz) - vView.xyz;                      // 2 alu  		    
+
+    half fFresnel = FresnelBias + FresnelScale * pow(1.0h - fNdotE, 5.0); // 4 inst
+
+    half4 cSpecularMap = 1;
+    #if %SPECULAR_MAP
+        cSpecularMap = GetTexture2D(specularMapSampler, IN.baseTC.xy);
+    #endif
+
+    half3 cSpecular = cSpecularAccRT.xyz * cSpecularMap.xyz * PerMaterial_SpecularColor.xyz;
+
+    // Apply fresnel to reflections
+    cSpecular.xyz *= fFresnel;
+
+    OUT.Color.xyz += cSpecular.xyz;
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    #if %VERTCOLORS
+        OUT.Color.xyz *= IN.Color.xyz;
+    #endif
+
+    // Re-scale range
+    OUT.Color.w = baseColor.w * IN.maskTC.w;
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+  
+    #if %_RT_FOG
+        #if !%_RT_VOLUMETRIC_FOG
+        ComputeGlobalFogPS(OUT.Color.xyz, IN.vView.w);
+        OUT.Color.xyz = IN.AvgFogVolumeContrib.xyz + OUT.Color.xyz * IN.AvgFogVolumeContrib.w;
+        OUT.Color.w *= IN.vView.w;
+        #else
+            VolumetricFogTexcoord vtc = GetVolumetricFogTexcoordParamByScreenProj(IN.screenProj);
+            float4 vf = GetVolumetricFogValue(vtc);
+            ApplyVolumetricFog(vf, IN.AvgFogVolumeContrib, vtc, OUT.Color.rgb);
+        #endif
+    #endif
+
+    return OUT;  
+}
+
+
+//////////////////////////////// technique ////////////////
+
+technique General
+<
+  string Script = 
+        "TechniqueZ=ZPass;"
+>
+{
+    pass p0
+    {
+        VertexShader = MonitorVS() GeneralVS;
+        PixelShader = MonitorPS() GeneralPS;
+
+        ZEnable = true;
+        ZWriteEnable = false;
+        CullMode = Back;
+
+        //SrcBlend = SRC_ALPHA;
+        //DestBlend = ONE_MINUS_SRC_ALPHA;
+        //AlphaBlendEnable = true;                
+    } 
+}
+
+//////////////////////////////// Common techniques ////////////////
+
+//////////////////////////////////////////////////////////////////
+// Custom Zpass for "monitor":
+//	- avoid poluting even further common zpass with yet aditional permutation
+
+sampler2D noiseSampler = sampler_state
+{
+    Texture = EngineAssets/Textures/noise.dds;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = LINEAR; 
+    AddressU = Wrap;
+    AddressV = Wrap;
+};
+
+///////////////// vertex input/output //////////////////
+
+struct vert2fragZ
+{
+    OUT_HPOS_IN_WPOS
+
+    float4 baseTC    : TEXCOORDN;
+    half4 vTangent   : TEXCOORDN;
+    half4 vBinormal  : TEXCOORDN;  
+};
+
+///////////////// vertex shaders //////////////////
+vert2fragZ ZPassVS(app2vertZGeneral IN)
+{
+    vert2fragZ OUT = (vert2fragZ)0;
+    streamPos vertPassPos = (streamPos)0;
+    streamPos_FromZ(IN, vertPassPos);
+
+    OUT.HPosition = Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos);  
+
+    float3 vPos = mul(vertPassPos.InstMatrix, vertPassPos.Position).xyz;
+    #if !%_RT_OBJ_IDENTITY
+        vPos += PerView_WorldViewPos.xyz;
+    #endif
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Output tangents
+
+    // Note: Normalization required for normal diffuse map in world space in case scale used - Do not remove
+    float3 worldTangentS = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]) );
+    float3 worldTangentT = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+
+    OUT.vTangent = float4(worldTangentS, vertPassPos.Tangent.w); 
+    OUT.vBinormal.xyz = worldTangentT;
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Output uv coordinates
+    float4 baseTC = vertPassPos.baseTC;  
+
+    _ModifyUV_1(baseTC, OUT.baseTC, vertPassPos.Position );
+
+   
+    #if %_RT_ALPHATEST
+        OUT.baseTC.w = GetMaterial_AlphaTest();
+    #endif
+#if %_RT_DISSOLVE
+        OUT.baseTC.z = GetInstance_DissolveRef(vertPassPos).x;
+	// vBinormal.w is available, let's store the clip factor of the dissolve mesh.
+	// Not sure why passing it through vertex interpolator instead of passing a cb to the pixel shader.
+        OUT.vBinormal.w = GetInstance_DissolveRef(vertPassPos).y;
+#endif
+    return OUT;
+}
+
+///////////////// pixel shaders //////////////////
+
+pixout_gbuffer ZPassPS(vert2fragZ IN)
+{
+    pixout_gbuffer OUT = (pixout_gbuffer) 0.5;
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Depth and alpha test processing
+    
+    #if %_RT_ALPHATEST
+        half fDiffuseAlpha = GetTexture2D(diffuseMapSampler, IN.baseTC.xy).w;
+        clip(fDiffuseAlpha - IN.baseTC.w);
+    #endif
+#if %_RT_DISSOLVE 
+     // vBinormal.w contains the dissolveRef (1 or -1) of the dissolve mesh.
+      clip(IN.vBinormal.w * DissolveFunction(IN.WPos.xy, IN.baseTC.z));
+#endif
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Normals
+
+    MaterialAttribsCommon attribs = MaterialAttribsDefault();
+
+    half3x3 mTangentToWS = half3x3(IN.vTangent.xyz, IN.vBinormal.xyz, cross(IN.vTangent.xyz, IN.vBinormal.xyz)*IN.vTangent.w);  
+    half3 vNormalTS = GetNormalMap(normalMapSampler, IN.baseTC.xy);
+
+    attribs.NormalWorld = normalize( mul( vNormalTS, mTangentToWS ) );
+
+    #if FEATURE_VELOCITY_TARGET
+        OUT.VelocityRT = float2(MOTION_BLUR_STATIC_OBJECT_KEY, MOTION_BLUR_STATIC_OBJECT_KEY);
+    #endif
+
+    EncodeGBuffer( attribs, OUT.GBufferA, OUT.GBufferB, OUT.GBufferC );
+
+    return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique ZPass
+{
+    pass p0
+    {
+        VertexShader = ZPassVS() ZVS;
+        PixelShader = ZPassPS() ZPS;
+
+        ZEnable = true;
+        ZWriteEnable = true;  
+        CullMode = Back;
+    }
+}
+
+/////////////////////// eof ///

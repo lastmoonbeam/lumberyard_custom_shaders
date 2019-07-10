@@ -1,0 +1,407 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "PostEffectsLib.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = PostProcess;"
+>; 
+
+Texture2D<float4> NativeDepthTex : register(t16);
+
+cbuffer PassConstants_DepthOfField : CONSTANT_BUFFER_PER_PASS
+{
+    float4 PerPass_FocusParams0;
+    float4 PerPass_FocusParams1;
+}
+
+// Must match CDepthOfField::SquareTapSizeMax
+#define SQUARE_TAP_SIZE_MAX 7
+
+cbuffer SubPassConstants_DepthOfField : CONSTANT_BUFFER_PER_SUBPASS
+{
+    float4 PerSubPass_ScreenSize;
+    float4 PerSubPass_Taps[SQUARE_TAP_SIZE_MAX * SQUARE_TAP_SIZE_MAX];
+    float4 PerSubPass_TapCount;  //x = tapCount y,z,w = unused   
+}
+
+void ComputeCircleOfConfusion(in float4 depths, out float4 nearCoC, out float4 farCoC)
+{
+    float4 FocusRangeNearMin = PerPass_FocusParams1.y * saturate(1 - (depths / PerPass_FocusParams1.x)) ;
+    float4 vCocFar = saturate(depths * PerPass_FocusParams0.x + PerPass_FocusParams0.y);
+    float4 vCocNear = saturate(depths * PerPass_FocusParams0.z + PerPass_FocusParams0.w) + FocusRangeNearMin;
+
+    farCoC = vCocFar * vCocFar * PerPass_FocusParams1.w;
+    nearCoC = vCocNear * vCocNear * PerPass_FocusParams1.w;
+
+    farCoC = clamp(farCoC, 0.00001, 4);
+    nearCoC = clamp(nearCoC, -4, 4);
+}
+
+struct vtxOutDownscaleDof
+{
+    float4 HPosition  : POSITION;
+    float4 tc0 : TEXCOORD0;
+    float4 tc1 : TEXCOORD1;
+    float4 tc2 : TEXCOORD2;
+    float4 tc3 : TEXCOORD3;
+    float4 tc4 : TEXCOORD4;
+    float4 tc5 : TEXCOORD5;
+    float4 tc6 : TEXCOORD6;
+};
+
+vtxOutDownscaleDof DownscaleDofVS(vtxInWPOS IN)
+{
+    vtxOutDownscaleDof OUT = (vtxOutDownscaleDof)0; 
+    OUT.HPosition = float4(float2(IN.Position.x, 1.0f - IN.Position.y)*2-1, IN.Position.z, 1.0);
+
+#if !GMEM // reduce taps for mobile
+    OUT.tc0 = IN.baseTC.xyxy + float4(-1, -1,  1,  1) * PerView_ScreenSize.zwzw * 0.5;
+    OUT.tc1 = IN.baseTC.xyxy + float4( 1, -1, -1,  1) * PerView_ScreenSize.zwzw * 0.5;
+    OUT.tc3 = IN.baseTC.xyxy + float4(-1,  0,  1,  0) * PerView_ScreenSize.zwzw;
+    OUT.tc4 = IN.baseTC.xyxy + float4( 0, -1,  0,  1) * PerView_ScreenSize.zwzw;
+    OUT.tc5 = IN.baseTC.xyxy + float4( 1,  1, -1, -1) * PerView_ScreenSize.zwzw;
+    OUT.tc6 = IN.baseTC.xyxy + float4(-1,  1,  1, -1) * PerView_ScreenSize.zwzw;
+#endif
+
+    OUT.tc2.xy =  IN.baseTC.xy;
+    return OUT;
+}
+
+struct OutDownscaleDof
+{
+    float4 LayerNear : COLOR0;
+    float4 LayerFar : COLOR1;
+    float2 CocNearFar : COLOR2;
+};
+
+OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+{
+    OutDownscaleDof OUT = (OutDownscaleDof) 0;
+
+    // Reduce # of taps with GMEM mobile path
+#if GMEM
+    OUT.LayerNear = float4(tex2D(_tex1, IN.tc2.xy).rgb, 1);
+    float4 depths = GatherRed(_tex0_D3D11, _smp0_D3D11, IN.tc2.xy);
+    depths *= PerView_NearFarClipDist.y;
+
+    float4 nearCoC, farCoC;
+    ComputeCircleOfConfusion(depths, nearCoC, farCoC);
+#else
+
+    // We are temporally filtering, so we pull the CoC from an accumulation buffer
+    // instead of deriving it here.
+    #if %_RT_SAMPLE2
+        float4 tap0 = float4(tex2D(_tex2, IN.tc5.xy).xy, tex2D(_tex2, IN.tc5.zw).xy);
+        float4 tap1 = float4(tex2D(_tex2, IN.tc6.xy).xy, tex2D(_tex2, IN.tc6.zw).xy);
+        float4 nearCoC = float4(tap0.xz, tap1.xz);
+        float4 farCoC = float4(tap0.yw, tap1.yw);
+    #else
+        float4 depths = float4(tex2D(_tex0, IN.tc5.xy).x,
+            tex2D(_tex0, IN.tc5.zw).x,
+            tex2D(_tex0, IN.tc6.xy).x,
+            tex2D(_tex0, IN.tc6.zw).x);
+        depths *= PerView_NearFarClipDist.y;
+
+        float4 nearCoC, farCoC;
+        ComputeCircleOfConfusion(depths, nearCoC, farCoC);
+    #endif
+
+    float4 c = float4(tex2D(_tex1, IN.tc2.xy).rgb, 1);
+    float4 c0 = float4(tex2D(_tex1, IN.tc0.xy).rgb, 1);
+    float4 c1 = float4(tex2D(_tex1, IN.tc0.zw).rgb, 1);
+    float4 c2 = float4(tex2D(_tex1, IN.tc1.xy).rgb, 1);
+    float4 c3 = float4(tex2D(_tex1, IN.tc1.zw).rgb, 1);
+    OUT.LayerNear = (c+c0 + c1 + c2 + c3) * 0.2; 
+#endif
+    OUT.LayerFar = OUT.LayerNear; 
+
+    OUT.LayerNear.a = max(nearCoC.x, nearCoC.y);
+    OUT.LayerNear.a = max(OUT.LayerNear.a, nearCoC.z);
+    OUT.LayerNear.a = max(OUT.LayerNear.a, nearCoC.w);
+
+    OUT.LayerFar.a = min(farCoC.x, farCoC.y);
+    OUT.LayerFar.a = min(OUT.LayerFar.a, farCoC.z);
+    OUT.LayerFar.a = min(OUT.LayerFar.a, farCoC.w);
+
+    OUT.CocNearFar = float2(OUT.LayerNear.a, OUT.LayerFar.a);
+#if GMEM
+    OUT.CocNearFar.g = 0.0f;
+#endif
+
+    // Clamp for proper masking later (avoids "super strong" edges on very blurry foreground objects).
+    OUT.LayerNear.a = saturate(OUT.LayerNear.a);
+
+    // Scale with CoC to avoid leaking of sharper details.
+    OUT.LayerFar.rgb *= (OUT.LayerFar.a);
+    OUT.LayerNear.rgb *= (OUT.LayerNear.a);
+
+    return OUT;
+}
+
+technique DownscaleDof
+{
+    pass p0
+    {
+        VertexShader = DownscaleDofVS();
+        PixelShader = DownscaleDofPS();
+        CullMode = None;
+    }
+}
+
+struct OutTileMinCoC
+{
+    float2 CocNearFar : COLOR0;
+};
+
+OutTileMinCoC TileMinCoCPS(vtxOut IN)
+{
+    OutTileMinCoC OUT = (OutTileMinCoC) 0;
+
+#if	!GMEM
+    float2 uv = IN.baseTC.xy;
+    float4 tc0 = uv.xyxy + float4(-1,  0, 1,  0) * PerSubPass_ScreenSize.zwzw;
+    float4 tc1 = uv.xyxy + float4( 0, -1, 0,  1) * PerSubPass_ScreenSize.zwzw;
+    float4 tc2 = uv.xyxy + float4(-1, -1, 1,  1) * PerSubPass_ScreenSize.zwzw;
+    float4 tc3 = uv.xyxy + float4(-1,  1, 1, -1) * PerSubPass_ScreenSize.zwzw;
+
+    float2 coc0 = (tex2D(_tex0, tc0.xy).rg);
+    float2 coc1 = (tex2D(_tex0, tc0.zw).rg);
+    float2 coc2 = (tex2D(_tex0, tc1.xy).rg);
+    float2 coc3 = (tex2D(_tex0, tc1.zw).rg);
+    float2 coc4 = (tex2D(_tex0, tc2.xy).rg);
+    float2 coc5 = (tex2D(_tex0, tc2.zw).rg);
+    float2 coc6 = (tex2D(_tex0, tc3.xy).rg);
+    float2 coc7 = (tex2D(_tex0, tc3.zw).rg);
+
+    OUT.CocNearFar.r = max(coc0.rg, max(coc1, max(coc2, coc3))).r; // direction is inverted, take max
+    OUT.CocNearFar.g = min(coc0.rg, min(coc1, min(coc2, coc3))).g;
+
+    OUT.CocNearFar.r = max(OUT.CocNearFar.rg, max(coc4, max(coc5, max(coc6, coc7)))).r; // direction is inverted, take max
+    OUT.CocNearFar.g = min(OUT.CocNearFar.rg, min(coc4, min(coc5, min(coc6, coc7)))).g;
+
+    return OUT;
+#else
+    float2 tc0 = IN.baseTC.xyxy + float4(-1, -1, 1,  1) * 0.5f * PerSubPass_ScreenSize.zwzw;
+    float4 tc1 = IN.baseTC.xyxy + float4(-1,  1, 1, -1) * PerSubPass_ScreenSize.zwzw;
+
+    float4 cocA = GatherRed(_tex0_D3D11, _smp0_D3D11, tc0.xy);
+    float4 cocB = GatherRed(_tex0_D3D11, _smp0_D3D11, tc0.xy);
+    float coc0 = _tex0_D3D11.Sample(_smp0_D3D11, tc1.xy);
+    float coc1 = _tex0_D3D11.Sample(_smp0_D3D11, tc1.zw);
+
+    OUT.CocNearFar.r = max(cocA.x, max(cocA.y, max(cocA.z, cocA.w))).r; // direction is inverted, take max
+    OUT.CocNearFar.r = max(OUT.CocNearFar.r, max(cocB.x, max(cocB.y, max(cocB.z, cocB.w)))).r; // direction is inverted, take max
+    OUT.CocNearFar.r = max(OUT.CocNearFar.r, max(coc0, coc1)).r; // direction is inverted, take max
+    OUT.CocNearFar.g = 0.0f;
+
+    return OUT;
+#endif
+}
+
+technique TileMinCoC
+{
+    pass p0
+    {
+        VertexShader = BaseWPOSVS();
+        PixelShader = TileMinCoCPS();
+        CullMode = None;
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct pixout_dof
+{
+    float4 LayerNear : COLOR0;
+    float4 LayerFar : COLOR1;
+    float2 CocNearFar : COLOR2;
+};
+
+pixout_dof DofPS(vtxOutWPOS IN)
+{
+    pixout_dof OUT = (pixout_dof) 0;
+
+    float2 fCocScale = PerSubPass_ScreenSize.zw;
+
+    // Rescale (tweaked to be compatible with Sprite DOF)
+    float scale = max(PerSubPass_ScreenSize.x / 1920, PerSubPass_ScreenSize.y / 1080) * 4;
+    fCocScale *= scale;
+
+    static const float fOpticalVignettingAmount = 0.2f;
+    float2 optv_tc = (IN.baseTC.xy * 2 - 1) * fOpticalVignettingAmount;
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+    fCocScale *= 0.15;
+#endif
+
+    float4 cCenterTapNear =tex2Dlod(_tex1, float4(IN.baseTC.xy, 0, 0));
+    float4 cCenterTapFar =tex2Dlod(_tex2, float4(IN.baseTC.xy, 0, 0));
+
+    float fCocNear = cCenterTapNear.w;
+    float fCocFar = cCenterTapFar.w;
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1	
+    float4 cAccNear = float4(0,0,0,0);
+    float caccNear = 0;
+
+    float4 cAccFar = float4(0,0,0,fCocFar);
+    float caccFar = 0;
+
+    OUT.LayerFar = cCenterTapFar;
+    OUT.LayerNear = cCenterTapNear;
+#else
+    float4 cAccNear = float4(0,0,0,0);
+    float caccNear = 0;
+
+    float4 cAccFar = float4(0,0,0,0);
+    float caccFar = 0;
+#endif
+
+    const float2 vMinTileCoC = (tex2Dlod(_tex4, float4(IN.baseTC.xy, 0, 0)).rg);
+
+    // note - on nvidia getting better perf with single branch outside loops. on amd the oposite
+    [branch] if (vMinTileCoC.r>0.0)
+    {
+        [loop] for(int t = 0; t < PerSubPass_TapCount.x; t ++)
+        {
+            const float2 offset = PerSubPass_Taps[t].xy;
+            const float fOptVignetting = 1 - abs(dot(optv_tc.xy, offset.xy));
+
+            float2 cocOffset = vMinTileCoC.r * fOptVignetting * fCocScale * offset.xy;
+            float4 cn = tex2Dlod(_tex1, float4(IN.baseTC.xy + cocOffset, 0, 0));
+
+            const float k = 1.075;
+            float wn = (cn.w >= vMinTileCoC.r * k) ? 1 : saturate(vMinTileCoC.r * k - cn.w);
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+            cAccNear = max(cAccNear, cn);
+#else
+            cAccNear += cn*wn;
+            caccNear += wn;
+#endif
+        }
+    }
+
+    //[branch] if (vMinTileCoC.g>=0.0)
+    {
+        [loop] for(int t = 0; t < PerSubPass_TapCount.x; t ++)
+        {
+            const float2 offset = PerSubPass_Taps[t].xy;
+            const float fOptVignetting = 1-abs(dot(optv_tc.xy, offset.xy));
+
+            float2 cocOffset = fCocFar * fOptVignetting * fCocScale * offset.xy;
+
+            float4 cf = tex2Dlod(_tex2, float4(IN.baseTC.xy + cocOffset, 0, 0));
+            float wf = (cf.w >= fCocFar) ? 1 : saturate( cf.w );
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+            cAccFar = max(cAccFar, cf*wf);
+#else
+            cAccFar += cf*wf;
+            caccFar += wf;
+#endif
+        }
+    }
+
+#if !%_RT_SAMPLE0 && !%_RT_SAMPLE1
+    cAccNear = caccNear ? cAccNear * rcp(caccNear) : cCenterTapNear;
+    cAccFar = caccFar? cAccFar * rcp(caccFar) : cCenterTapFar;
+#endif
+
+    OUT.LayerNear = cAccNear;
+    OUT.LayerNear.a = (OUT.LayerNear.a);
+    OUT.LayerFar = cAccFar;
+    OUT.LayerFar.a = (OUT.LayerFar.a);
+    OUT.CocNearFar.rg = (float2(OUT.LayerNear.a, OUT.LayerFar.a));
+
+#if GMEM
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+    OUT.CocNearFar = 0.0f;
+#endif
+    OUT.CocNearFar.g = 0.0f;
+#endif
+
+    return OUT;
+}
+
+technique Dof
+{
+    pass p0
+    {
+        VertexShader = BaseWPOSVS() PostMotionBlurVS;
+        PixelShader = DofPS() HDRPostProcessPS;
+        CullMode = None;
+    }
+}
+
+pixout CompositeDofPS(vtxOut IN)
+{
+    pixout OUT = (pixout) 0;
+
+#if GMEM
+    half4 cScene = GMEM_HDR_RT0.Load(int3(0,0,0));
+
+    // Bicubic sampling is overkill on mobile.  We use bilinear instead but it may cause artifacts on edges of objects.
+    // Need to further test this out on various DOF scenes.
+    // We save over 3ms on avg on iPAD Air 2 using bilinear instead of bicubic
+    // We save a bit over 1ms on avg on iPAD Air 2 using bicubic only for the near layer
+    half4 cLayerNear = tex2D(_tex1, IN.baseTC.xy);
+    half4 cLayerFar = tex2D(_tex2, IN.baseTC.xy);
+#else
+    half4 cScene = tex2D(_tex4, IN.baseTC.xy);
+    half4 cLayerNear = tex2D_bicubic(_tex1, IN.baseTC.xy, PerView_ScreenSize.xy *0.5);
+    half4 cLayerFar = tex2D_bicubic(_tex2, IN.baseTC.xy, PerView_ScreenSize.xy *0.5);
+#endif
+
+    // When using temporal filtering, we pull from an accumulation buffer instead of
+    // deriving the CoC in place. This is because jitter will cause aliasing.
+#if %_RT_SAMPLE2
+    float2 CoC = tex2D(_tex5, IN.baseTC.xy).xy;
+#else
+    float depth = tex2D(_tex0, IN.baseTC.xy).x * PerView_NearFarClipDist.y; 
+
+    float4 nearCoC, farCoC;
+    ComputeCircleOfConfusion(depth.xxxx, nearCoC, farCoC);
+
+    float2 CoC = float2(nearCoC.x, farCoC.x);
+#endif
+
+    cLayerFar.rgb /= cLayerFar.a > 0 ? cLayerFar.a : 1.0f;
+    cLayerFar.a = saturate( CoC.y );
+
+    cLayerNear.rgb = cLayerNear.rgb / (cLayerNear.a > 0 ? cLayerNear.a : 1.0f);
+    cLayerNear.a = saturate(cLayerNear.a);
+
+    OUT.Color = lerp(cScene, cLayerFar, cLayerFar.a);
+    OUT.Color = lerp(OUT.Color, cLayerNear, cLayerNear.a);
+
+    return OUT;
+}
+
+technique CompositeDof
+{
+    pass p0
+    {
+        VertexShader = BaseWPOSVS() PostMotionBlurVS;
+        PixelShader = CompositeDofPS() HDRPostProcessPS;
+        CullMode = None;
+    }
+}

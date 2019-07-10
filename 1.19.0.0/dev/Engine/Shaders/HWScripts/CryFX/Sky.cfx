@@ -1,0 +1,188 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ModificatorVT.cfi"
+#include "shadeLib.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "Public;"
+           "ShaderDrawType = Sky;"
+           "ShaderType = Sky;"
+>;
+
+/// Un-Tweakables //////////////////////
+float4 TFactor     : PB_TFactor;
+
+sampler2D whiteSampler = sampler_state
+{
+  Texture = $White;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR;
+};
+
+///////////////////////////// 
+ 
+struct a2v 
+{
+  float4 Position : POSITION; //in object space
+  float2 baseTC   : TEXCOORD0;
+	IN_C0
+};
+
+struct v2f
+{
+  float4 Position  : POSITION;  //in projection space
+  float2 baseTC    : TEXCOORD0;
+  float3 viewDir	 : TEXCOORD1;
+};
+ 
+struct v2fZ
+{
+  float4 Position  : POSITION;  //in projection space
+}; 
+
+///////////////// vertex shader //////////////////
+v2f SkyVS(a2v IN)
+{
+  v2f OUT = (v2f)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.Position = _pos_Common(vPos);
+
+  /*
+    The following two lines project the sky to the background. To explain that, you need to undestand what
+    OUT.Position looks like here. OUT.Position is in post projection space, which looks something like this:
+    ( some form of x, some form of y, z * (f-n)...., z ) where z is the z in view space.
+    After this, when the shader outputs the triangle, the perspective divide happens where everything is divided by w:
+    ( some form of x / z, some form of y / z, z * (f-n).... / z, z / z )
+    So if you look at the line OUT.Position.z = OUT.Position.w; you can see what they are doing: the Z will always be 1 for
+    each point no matter what. That means that in homogeneous coordinates, all Z will be projected to the far plane, which is 1.
+    Now, in case of reverse depth, the far plane is 0. Given that 0 / by any number different than 0 is 0, we just set z to 0
+    and that projects each z to the far plane which is, once again, 0.
+
+    Note: this can be done with the skybox because it's a far looking object that doesn't need perspective: projecting an object 
+    close to the camera onto the far plane will change its look, so this is feasible only with already far 
+    distant object for which perspective distortion is less noticeable.
+  */
+#ifdef %_RT_REVERSE_DEPTH
+  OUT.Position.z = 0.f;
+#else
+  OUT.Position.z = OUT.Position.w;
+#endif
+  
+  OUT.baseTC.xy = IN.baseTC.xy;  
+  
+  OUT.viewDir = IN.Position.xyz;
+
+  return OUT; 
+} 
+
+v2fZ SkyZVS(a2v IN)
+{
+  v2fZ OUT = (v2fZ)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.Position = _pos_Common(vPos);
+#ifdef %_RT_REVERSE_DEPTH
+  OUT.Position.z = 0;
+#else
+  OUT.Position.z = OUT.Position.w;
+#endif
+
+  return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+pixout SkyPS(v2f IN)
+{
+  pixout OUT;
+
+  half4 baseColor = tex2D(whiteSampler, IN.baseTC.xy);
+  half4 Color = baseColor * TFactor;
+
+   // Debug output
+ #if %_RT_DEBUG0 || %_RT_DEBUG1 || %_RT_DEBUG2 || %_RT_DEBUG3
+   DebugOutput(OUT.Color, float4(IN.baseTC.xy, 0, 0));
+   return OUT;
+ #endif
+  
+  half3 skyDir = normalize( IN.viewDir.xyz );  
+
+	HDROutput(OUT, Color, 1);
+	
+  return OUT;
+}
+
+pixout_gbuffer SkyZPS(v2fZ IN) 
+{
+	pixout_gbuffer OUT;
+	
+	MaterialAttribsCommon attribs = MaterialAttribsDefault();
+	attribs.Albedo = 0;  // Output black albedo for emissive surface
+	EncodeGBuffer( attribs, OUT.GBufferA, OUT.GBufferB, OUT.GBufferC );
+
+#if FEATURE_GMEM_LINEARIZE_DEPTH
+  // Clear stencil vals...
+  // for GMEM, instead of resolving stencil after Z-Pass,
+  // we write stencil values immediately in COLOR3. This way,
+  // we don't need to resolve the stencil and can keep buffers in GMEM.
+  OUT.LinDepthResSten.x = 1.0f;
+  OUT.LinDepthResSten.y = 0;
+#endif
+  return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique General
+<
+  string Script =
+         "TechniqueZ=ZPass;"
+>
+{
+  pass p0
+  {
+    VertexShader = SkyVS();
+    
+    ZEnable = true;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = SkyPS();
+  }
+}
+
+technique ZPass
+{
+  pass p0
+  {
+    VertexShader = SkyZVS();
+    
+    ZEnable = true;
+    ZWriteEnable = false;
+    CullMode = None;
+    
+    PixelShader = SkyZPS();
+  }
+}
+
+
+/////////////////////// eof ///

@@ -1,0 +1,12 @@
+// Settings
+#define PARTICLE_CURVE_TEXTURE_HEIGHT 32
+#define MAX_NUM_PARTICLE_CURVE_SAMPLES 32
+#define CURVE_SAMPLE_RANGE (1.0-1.0/MAX_NUM_PARTICLE_CURVE_SAMPLES)
+
+SamplerState ParticleCurveSampler : register(s10);
+
+Texture2D<float> ParticleCurveTexture : register(t9);    // per-emitter particle curves (always fixed on offset t9)
+float GetValueFromCurve(int curveID, float rawX)
+{
+    return ParticleCurveTexture.SampleLevel(ParticleCurveSampler, float2(rawX * CURVE_SAMPLE_RANGE, (float(curveID)+0.5) / float(PARTICLE_CURVE_TEXTURE_HEIGHT)), 0.0);
+}

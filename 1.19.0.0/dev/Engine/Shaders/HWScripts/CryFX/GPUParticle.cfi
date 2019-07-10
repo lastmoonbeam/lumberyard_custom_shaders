@@ -1,0 +1,62 @@
+// keep in sync with D3DGPUParticleEngine.cpp SGPUParticleData::EParticleDataFlags
+#define PARTICLE_FLAG_ORIENTTOVELOCITY      (0)
+#define PARTICLE_FLAG_FREE_FACING           (1)
+#define PARTICLE_FLAG_COLLIDE_DEPTH_BUFFER  (2)
+#define PARTICLE_FLAG_COLLISION_FLAG_DIE    (3)
+#define PARTICLE_FLAG_COLLISION_FLAG_IGNORE (4)
+#define PARTICLE_FLAG_COLLISION_FLAG_STOP   (5)
+#define PARTICLE_FLAG_TARGET_ATTRACTION_SHRINK (6)
+#define PARTICLE_FLAG_TARGET_ATTRACTION_ORBIT  (7)
+#define PARTICLE_FLAG_TARGET_ATTRACTION_EXTEND_SPEED (8)
+#define PARTICLE_FLAG_FACING_SHAPE (9)
+
+#define UV_ANIMATION_BLEND_ENABLED  (0)
+#define UV_ANIMATION_CYCLE_ONCE     (1)
+#define UV_ANIMATION_CYCLE_REPEAT   (2)
+#define UV_ANIMATION_CYCLE_MIRROR   (3)
+
+uint getParticleFlag(uint x, uint flag)
+{
+    // we & with the flag to get the flag value and then shift it towards the first bit to get 0 or 1
+    return (x & (1 << flag)) >> (flag);
+}
+
+uint setParticleFlag(uint x, uint flag)
+{
+    return (x | (1 << flag));
+}
+
+// float4 for position, velocity and rotation is used for alignment, iOS does not pack float3 + float, the w components of position, velocity and rotation are used to pack emitter position
+struct Particle
+{
+    float4 position; // float4 for iOS alignment, iOS does not pack float3 + float, w compontent is used as to pack emitter position.x
+    // - float4 boundary (16 bytes)
+
+    float4 rgba;
+    // - float4 boundary (32 bytes)
+
+    float4 velocity;  // float4 for iOS alignment, iOS does not pack float3 + float, w compontent is used to pack emitter position.y
+    // - float4 boundary (48 bytes)
+
+    float4 rotation;  // float4 for iOS alignment, iOS does not pack float3 + float, w compontent is used to pack emitter position.z
+    // - float4 boundary (64 bytes)
+
+    float4 previous_rotation_pos_z;
+    // - float4 boundary ( 80 bytes)
+
+    float2 scale;
+    float2 pivotXY;
+    // - float4 boundary ( 96 bytes)
+
+    float life;
+    float lifeMax;
+    float stretch;
+    float deltaTime; // 0.0 indicates the particle was just spawned
+    // - float4 boundary (112 bytes)
+
+    float2 previous_position_xy;
+    uint random0; // 4 random values - 8 bit per channel, intended for low quality random values
+    uint flags; // bit 0 is set as facing mode flag
+    // - float4 boundary (128 bytes)
+};
+

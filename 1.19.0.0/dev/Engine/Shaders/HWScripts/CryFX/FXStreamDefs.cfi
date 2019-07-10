@@ -1,0 +1,290 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+//=== Base stream definitions ==================================================
+#if PCDX11 || DURANGO // ACCEPTED_USE
+    #if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+        #if !%_RT_DISSOLVE && !%TEMP_VEGETATION && !%TEMP_TERRAIN
+            #define PIXEL_DEPTH_MODIFIER
+        #endif
+    #endif
+#endif
+
+#define IN_P    float4 Position  : POSITION;
+#define IN_C0   float4 Color     : COLOR;
+#define IN_TBASE float2 baseTC   : TEXCOORD0;
+
+// ==== Additional streams ==================================
+
+#define IN_TANG_STREAM                                                              \
+#if %_RT_SKINNING_DUAL_QUAT || %_RT_SKINNING_DQ_LINEAR || %_RT_SKINNING_MATRIX      \
+          float4 Tangent  : TANGENT;                                                \
+#else                                                                               \
+          float4 Tangent  : TANGENT;                                                \
+          float4 Binormal : BINORMAL;                                               \
+#endif
+
+
+#define IN_SKIN_STREAM float4 BlendWeights : BLENDWEIGHT; int4 BlendIndices : BLENDINDICES;
+
+#define IN_VERTEX_VELOCITY_STREAM	       \
+		float3 VertexVelocity : POSITION3; \
+
+
+//=== Vertex shader output ===================================================
+
+// Note: Removing isolate from HPosition saves ~20% VS ALU, and very significant waterfalling cost
+// 	 Opto limited to skinned shaders for now. Non-skinned requires some more testing to ensure no z-fighting is introduced
+
+#define ISOLATE
+
+#define OUT_P float4 HPosition : POSITION;
+
+#define OUT_HPOS									\
+	#if !%_PS										\
+		float4 HPosition : SV_Position;				\
+	#endif
+
+#define IN_WPOS										\
+	float4 WPos : SV_Position;
+
+#ifdef PIXEL_DEPTH_MODIFIER
+    #define OUT_HPOS_IN_WPOS							\
+        #if %_PS										\
+            linear noperspective centroid float4 WPos : SV_Position;					\
+        #else											\
+            float4 HPosition : SV_Position;				\
+        #endif
+#else
+    #define OUT_HPOS_IN_WPOS							\
+        #if %_PS										\
+            float4 WPos : SV_Position;			    	\
+        #else											\
+            float4 HPosition : SV_Position;				\
+        #endif
+#endif
+// if %_PS could be used in global scope, could simplify this a bit
+
+#define FRONT_FACE_PS								\
+	#if %_PS										\
+		bool bIsFrontFace : SV_IsFrontFace;			\
+	#endif
+
+#define OUT_C0   half4 Color     : COLOR0;
+#define OUT_C1   half4 Color1    : COLOR1;
+
+//=== Pixel shader output structure ==========================================
+
+// Gmem RT slots must match the ones in CD3D9Renderer::FX_GmemTransition
+#if %ST_GMEM_256BPP
+    // Since gmem 256 use the same RT configuration for GBuffer and Lighting passes, Slot 0 is reserved
+    // for the HDR scene output. That's why we move the Normals to Slot 5.
+    #define GBufferAslot                COLOR5
+    #define LinDepthResStenSlot         COLOR3
+#elif %ST_GMEM_128BPP
+    #define GBufferAslot                COLOR0
+    #if %ST_GMEM_VELOCITY_BUFFER
+        // Check if we have enough RTs for depth and velocity
+        #if %ST_GMEM_RT_GREATER_FOUR
+            #define LinDepthResStenSlot COLOR3
+            #define VelocityRTSlot      COLOR4
+        #else
+            #define VelocityRTSlot      COLOR3
+        #endif
+    #else
+        #define LinDepthResStenSlot     COLOR3
+    #endif
+#else
+    #define GBufferAslot                COLOR0
+    #define VelocityRTSlot              COLOR3
+#endif
+
+#if VelocityRTSlot
+    #define FEATURE_VELOCITY_TARGET
+#endif
+
+#if LinDepthResStenSlot
+    #define FEATURE_GMEM_LINEARIZE_DEPTH
+#endif
+
+struct pixout
+{
+    half4 Color : COLOR0;
+    #if %DEPTH_FIXUP && %_RT_DEPTHFIXUP
+        half4 Alpha : COLOR1;
+    #endif
+};
+
+#if GMEM && FEATURE_VELOCITY_TARGET
+    struct pixout_gmemvel
+    {
+        half4 Color : VelocityRTSlot;
+        #if %DEPTH_FIXUP
+            half4 Alpha : COLOR1;
+        #endif
+    };
+    #define pixout_vel pixout_gmemvel
+#else
+    #define pixout_vel pixout
+#endif
+
+struct pixout_fp
+{
+  float4 Color  : COLOR0;
+};
+
+struct pixout_gbuffer
+{
+    half4 GBufferA : GBufferAslot;
+    half4 GBufferB : COLOR1;
+    half4 GBufferC : COLOR2;
+
+#if !%_RT_ALPHABLEND
+    #if LinDepthResStenSlot
+        half2 LinDepthResSten : LinDepthResStenSlot;
+    #endif
+    #if VelocityRTSlot
+        half2 VelocityRT : VelocityRTSlot;
+    #endif
+
+#endif
+
+#ifdef PIXEL_DEPTH_MODIFIER
+    #if %_RT_REVERSE_DEPTH
+        float fDepth : SV_DepthGreaterEqual;
+    #else
+        float fDepth : SV_DepthLessEqual;
+    #endif
+#endif
+};
+
+// GMEM Inputs. These should be properly handled by HLSLcc
+#define GMEM_ARM_COLOR_SLOT0    t93 // gl_LastFragColorARM
+#define GMEM_ARM_DEPTH          t94 // gl_LastFragDepthARM
+#define GMEM_ARM_STENCIL        t95 // gl_LastFragStencilARM
+
+#define GMEM_FLOAT_SLOT0	t96
+#define GMEM_FLOAT_SLOT1	t97
+#define GMEM_FLOAT_SLOT2	t98
+#define GMEM_FLOAT_SLOT3	t99
+#define GMEM_FLOAT_SLOT4	t100
+#define GMEM_FLOAT_SLOT5	t101
+#define GMEM_FLOAT_SLOT6	t102
+#define GMEM_FLOAT_SLOT7	t103
+
+#define GMEM_FLOAT2_SLOT0	t104
+#define GMEM_FLOAT2_SLOT1	t105
+#define GMEM_FLOAT2_SLOT2	t106
+#define GMEM_FLOAT2_SLOT3	t107
+#define GMEM_FLOAT2_SLOT4	t108
+#define GMEM_FLOAT2_SLOT5	t109
+#define GMEM_FLOAT2_SLOT6	t110
+#define GMEM_FLOAT2_SLOT7	t111
+
+#define GMEM_FLOAT3_SLOT0	t112
+#define GMEM_FLOAT3_SLOT1	t113
+#define GMEM_FLOAT3_SLOT2	t114
+#define GMEM_FLOAT3_SLOT3	t115
+#define GMEM_FLOAT3_SLOT4	t116
+#define GMEM_FLOAT3_SLOT5	t117
+#define GMEM_FLOAT3_SLOT6	t118
+#define GMEM_FLOAT3_SLOT7	t119
+
+#define GMEM_FLOAT4_SLOT0	t120
+#define GMEM_FLOAT4_SLOT1	t121
+#define GMEM_FLOAT4_SLOT2	t122
+#define GMEM_FLOAT4_SLOT3	t123
+#define GMEM_FLOAT4_SLOT4	t124
+#define GMEM_FLOAT4_SLOT5	t125
+#define GMEM_FLOAT4_SLOT6	t126
+#define GMEM_FLOAT4_SLOT7	t127
+
+#define GMEM_PLS_RO_SLOT	u60
+#define GMEM_PLS_WO_SLOT	u61
+#define GMEM_PLS_RW_SLOT	u62
+
+Texture2D<float4> GMEM_DepthBuff    : register(GMEM_ARM_DEPTH);
+Texture2D<int> GMEM_StencilBuff     : register(GMEM_ARM_STENCIL);
+
+#if %ST_GMEM_256BPP
+struct pixout_gmem
+{
+	float4 LightSpecular	: COLOR0;	          // 64 bits
+	float4 DiffuseRT	: COLOR1;	          // 32 bits
+	float4 SpecularRT	: COLOR2;	          // 32 bits
+	float2 LinDepthResSten	: LinDepthResStenSlot;    // 32 bits (16 bits linear depth, 8 bits stencil id, 8 bits sunmask)
+	float4 LightDiffuse	: COLOR4;	          // 64 bits
+	float4 NormalRT		: GBufferAslot;	          // 32 bits
+							  // 256 bits total
+};
+
+Texture2D<float3> GMEM_LightSpecular	: register(GMEM_FLOAT3_SLOT0);
+Texture2D<float4> GMEM_DiffuseRT		: register(GMEM_FLOAT4_SLOT1);
+Texture2D<float4> GMEM_SpecularRT		: register(GMEM_FLOAT4_SLOT2);
+Texture2D<float2> GMEM_LinDepthResSten	: register(GMEM_FLOAT2_SLOT3);
+Texture2D<float4> GMEM_LightDiffuse		: register(GMEM_FLOAT4_SLOT4);
+Texture2D<float4> GMEM_NormalRT			: register(GMEM_FLOAT4_SLOT5);
+
+// After the water pass we move the depth/stencil RT to the slot 1 because Qualcomm drivers
+// crash if you have a gap without render targets in the framebuffer attachments and you are fetching a 
+// value from it (e.g HDROutput in slot 0 and Depth/Stencil in slot 3)
+Texture2D<float2> GMEM_LinDepthResStenAW  : register(GMEM_FLOAT4_SLOT1);
+#endif
+
+
+#if %ST_GMEM_128BPP
+struct pixout_gmem
+{
+	float4 LightSpecular	: COLOR0;	// 64 bits	
+	float4 LightDiffuse		: COLOR1;	// 64 bits	     
+										// 128 bits total
+};
+
+#if %ST_GMEM_PLS
+// G-buffer & prior deferred passes. We can only sample COLOR0.
+Texture2D<float4> GMEM_NormalRT     : register(GMEM_ARM_COLOR_SLOT0);
+
+// Lighting pass
+struct Gmem128PLSStruct
+{
+	float2 lightSpecular_xy;
+	float2 lightSpecular_zw;
+	float2 lightDiffuse_xy;
+	float2 lightDiffuse_zw;
+};
+RWStructuredBuffer<Gmem128PLSStruct> GMEM_PLS_LightBuffers  : register(GMEM_PLS_RW_SLOT);
+#else
+
+// G-buffer & prior deferred passes
+Texture2D<float4> GMEM_NormalRT         : register(GMEM_FLOAT4_SLOT0);
+Texture2D<float4> GMEM_DiffuseRT        : register(GMEM_FLOAT4_SLOT1);
+Texture2D<float4> GMEM_SpecularRT       : register(GMEM_FLOAT4_SLOT2);
+
+// Lighting pass
+Texture2D<float3> GMEM_LightSpecular	: register(GMEM_FLOAT3_SLOT0);
+Texture2D<float4> GMEM_LightDiffuse		: register(GMEM_FLOAT4_SLOT1);
+#endif
+
+Texture2D<float2> GMEM_LinDepthResSten  : register(GMEM_FLOAT2_SLOT3);
+#endif // %ST_GMEM_PLS
+
+#if GMEM
+#define GMEM_SCENE_OUTPUT_RT 	LightSpecular
+#endif
+
+// GMEM POST-PROC TARGETS
+#if %ST_GMEM_PLS
+Texture2D<float4> GMEM_HDR_RT0          : register(GMEM_ARM_COLOR_SLOT0);
+#else
+Texture2D<float4> GMEM_HDR_RT0          : register(GMEM_FLOAT4_SLOT0);
+#endif

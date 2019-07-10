@@ -1,0 +1,64 @@
+#include "GPUParticle.cfi"
+#include "GPUParticleHelpers.cfi"
+
+float4 Parameters;                                                      // x = l, y = p, z = maxParticles, w = bufferOffset
+RWStructuredBuffer<uint2> ParticleSortIndices : register(u0);           // per-particle data
+
+uint oddEvenMergeSort_GetPartner(const int n, const int l, const int p)
+{
+    if (p == 1)
+        return n ^ (1 << (l - 1));
+
+    int scale = (1 << (l - p));
+    int box = (1 << p);
+    int nDivScale = (n/scale);
+    int sn = nDivScale - ( nDivScale / box) * box;
+
+    if (sn == 0 || sn == (box - 1))
+        return n;
+
+    if ((sn & 1) == 0)
+        return n - scale;
+    else
+        return n + scale;
+}
+
+[numthreads(256, 1, 1)]                                 
+void CS(
+    uint3 GroupId : SV_GroupID,
+    uint3 DispatchThreadId : SV_DispatchThreadID,       
+    uint3 GroupThreadId : SV_GroupThreadID,             
+    uint GroupIndex: SV_GroupIndex)                     
+{
+    // check if out of bounds, if so, skip iteration
+    const uint l = Parameters.x;
+    const uint p = Parameters.y;
+    const uint maxParticles = Parameters.z;
+    int bufferOffset = asint(Parameters.w);
+    
+    const int partner = oddEvenMergeSort_GetPartner(DispatchThreadId.x, l, p);
+    
+    if(partner >= maxParticles || DispatchThreadId.x >= maxParticles)
+        return;
+
+    if(partner > DispatchThreadId.x)
+    {
+        uint2 p0 = ParticleSortIndices[bufferOffset + DispatchThreadId.x];
+        uint2 p1 = ParticleSortIndices[bufferOffset + partner];
+        
+        if(p0.y > p1.y)
+        {
+            ParticleSortIndices[bufferOffset + partner] = p0;
+            ParticleSortIndices[bufferOffset + DispatchThreadId.x] = p1;
+        }
+    }
+}
+
+// Default technique
+technique Default
+{
+    pass p0
+    {
+        ComputeShader = CS();
+    }
+}

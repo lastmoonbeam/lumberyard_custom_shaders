@@ -1,0 +1,113 @@
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = FX;"
+>;
+
+
+//////////////////////////////// techniques ////////////////
+
+
+// Clouds
+/*
+technique CryCloudEditor
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\_CloudTemp.cld
+  }
+}
+
+//====================================================================
+
+technique CryCloud0
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\clouds\_stratus78-4s.cld
+  }
+}
+
+technique CryCloud1
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\clouds\_stratus68-4s.cld
+  }
+}
+
+technique CryCloud2
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\clouds\_stratus58-4s.cld
+  }
+}
+
+technique CryCloud3
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\clouds\_stratus48-4s.cld
+  }
+}
+
+technique CryCloud4
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+	ParticlesFile = Libs\Clouds\clouds\_stratus38-4s.cld
+  }
+}
+
+technique CryCloud5
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\clouds\_stratus28-4s.cld
+  }
+}
+
+technique CryCloud6
+<
+  string Script = "Public;";
+>
+{
+  CustomRE Cloud
+  {
+    Scale = 0.5
+    ParticlesFile = Libs\Clouds\clouds\_stratus18-4s.cld
+  }
+}
+*/
+
+/////////////////////// eof ///

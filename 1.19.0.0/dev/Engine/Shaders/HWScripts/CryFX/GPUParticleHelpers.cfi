@@ -1,0 +1,269 @@
+#define PI (3.141592653589793238462643383)
+#define DEG2RAD (0.0174532925199433)
+#define EPSILON (0.001)
+#define FLT_MAX (3.402823466e+38)
+#define F_HUGE (1e+9)
+
+#define SHAPE_NEEDS_ESTIMATED_VELOCITY (%_RT_GPU_PARTICLE_SHAPE_SPHERE || %_RT_GPU_PARTICLE_SHAPE_CIRCLE || %_RT_GPU_PARTICLE_SHAPE_BOX)
+
+float4 ed_emitterBounds; // xyz is bound values
+float4 ed_emitterConfineBounds; // confine bounds of box emitter
+
+
+// Cry_Quat.h SetRotationV0V1
+float4 quatCreateRotation(float3 v0, float3 v1)
+{
+    float dotVal = dot(v0, v1) + 1.0;
+
+    [branch]
+    if (dotVal > EPSILON)
+    {
+        float3 crossProd = cross(v0, v1);
+        float d = rsqrt(dotVal * dotVal + dot(crossProd, crossProd));
+        return float4(crossProd * d, dotVal * d);
+    }
+    else
+    {
+        float3 ortho = 0.9 * 0.9 * dot(v0, v0) - v0.x * v0.x < 0.0 ? float3(-v0.z, 0, v0.x) : float3(0, v0.z, -v0.y);
+        return float4(normalize(ortho), 0.0);
+    }
+}
+
+// Cry_Matrix33.h SetRotationAA()
+// axis must be normalized
+float3x3 axisRotationMatrix(float angle, float3 axis)
+{
+    float s, c;
+    sincos(angle, s, c);
+
+    float3x3 m;
+
+    float mc = 1 - c;
+    m._m00 = mc * axis.x * axis.x + c;
+    m._m01 = mc * axis.x * axis.y - axis.z * s;
+    m._m02 = mc * axis.x * axis.z + axis.y * s;
+    m._m10 = mc * axis.y * axis.x + axis.z * s;
+    m._m11 = mc * axis.y * axis.y + c;
+    m._m12 = mc * axis.y * axis.z - axis.x * s;
+    m._m20 = mc * axis.z * axis.x - axis.y * s;
+    m._m21 = mc * axis.z * axis.y + axis.x * s;
+    m._m22 = mc * axis.z * axis.z + c;
+
+    return m;
+}
+
+// Cry_Quat.h Vec3_tpl<F> operator * (const Quat_tpl<F>& q, const Vec3_tpl<F2>& v)
+float3 quatRotatePoint(float4 quat, float3 p)
+{
+    float3 r2 = cross(quat.xyz, p) + quat.w * p;
+    return cross(quat.xyz, r2) * 2.0 + p;
+}
+
+float4 quatSetRotationZ(float r)
+{
+    float s, c;
+    sincos(r * 0.5, s, c);
+    return float4(0, 0, s, c);
+}
+
+float4 quatSetRotationY(float r)
+{
+    float s, c;
+    sincos(r * 0.5, s, c);
+    return float4(0, s, 0, c);
+}
+
+// From Cry_Quat.h SetRotationXYZ
+float4 quatRotationXYZ(float3 rotation)
+{
+    float3 a = rotation;
+    float4 v;
+
+    float sx, cx;
+    sincos(a.x * 0.5, sx, cx);
+    float sy, cy;
+    sincos(a.y * 0.5, sy, cy);
+    float sz, cz;
+    sincos(a.z * 0.5, sz, cz);
+    v.w = cx * cy * cz + sx * sy * sz;
+    v.x = cz * cy * sx - sz * sy * cx;
+    v.y = cz * sy * cx + sz * cy * sx;
+    v.z = sz * cy * cx - cz * sy * sx;
+
+    return v;
+}
+
+float3 quatGetColumn0(float4 quat)
+{
+    float3 v = quat.xyz;
+    float w = quat.w;
+
+    return float3(2 * (v.x * v.x + w * w) - 1, 2 * (v.y * v.x + v.z * w), 2 * (v.z * v.x - v.y * w));
+}
+
+float3 quatGetColumn2(float4 quat)
+{
+    float3 v = quat.xyz;
+    float w = quat.w;
+
+    return float3(2 * (v.x * v.z + v.y * w), 2 * (v.y * v.z - v.x * w), 2 * (v.z * v.z + w * w) - 1);
+}
+
+// From Cry_Matrix33.h constructor Matrix33_tpl<F>(const Quat_tpl<F>&q)
+float3x3 quatToRotationMatrix(float4 quat)
+{
+    // CParticle::GetRenderMatrix
+    float3 vX = quatGetColumn0(quat);
+    float3 vZ = quatGetColumn2(quat);
+    float3 vY = cross(vZ, vX);
+
+    float3x3 rot = float3x3(vX, vY, vZ);
+    return rot;
+}
+
+float4 quatMul(float4 a, float4 b)
+{
+    return float4(cross(a.xyz,b.xyz) + (a.w * b.xyz) + (a.xyz * b.w), a.w * b.w - dot(a.xyz,b.xyz));
+}
+
+bool IsInEmitterConfineBounds(float3 particlePos, float3 emitterPos)
+{
+    float3 relativePos = particlePos - emitterPos;
+
+    if (relativePos.x >= -ed_emitterConfineBounds.x && relativePos.x <= ed_emitterConfineBounds.x && 
+        relativePos.y >= -ed_emitterConfineBounds.y && relativePos.y <= ed_emitterConfineBounds.y &&
+        relativePos.z >= -ed_emitterConfineBounds.z && relativePos.z <= ed_emitterConfineBounds.z)
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+float3 ClipSpaceToNDC(float4 clipSpace)
+{
+    return clipSpace.xyz / clipSpace.w;
+}
+
+float2 NDCToUV(float3 ndc)
+{
+    float2 uv = (ndc.xy + float2(1.0,1.0)) * float2(0.5,0.5);
+    uv.y = 1.0 - uv.y;
+    return uv;
+}
+
+// sort score based on camera position
+float getSortScore(in float3 cameraPosition, in float3 position)
+{
+    return 1.0 / distance(cameraPosition, position);
+}
+
+// cryEngine Math Functions
+float3 cry_vecGetOrthogonal(float3 v) 
+{
+    return ((0.9*0.9)*(dot(v,v))-v.x*v.x<0) ? float3(-v.z,0,v.x) : float3(0,v.z,-v.y);
+}
+
+float3 degreesToRadians(float3 degree)
+{
+    return degree * DEG2RAD; 
+}
+
+// randomness Helper Functions
+// unsequence ascending values
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+// linear congrentual RNG - faster but distribution is not as good..
+uint rand_lcg(inout uint rng_state)
+{
+    rng_state = 1664525 * rng_state + 1013904223;
+    return rng_state;
+}
+ 
+ // xorshift RNG - good distribution, but slower
+uint rand_xorshift(inout uint rng_state)
+{
+    rng_state ^= (rng_state << 13);
+    rng_state ^= (rng_state >> 17);
+    rng_state ^= (rng_state << 5);
+    return rng_state;
+}
+
+// convert rng value to [0.0, 1.0] range
+float rand_uintToFloat(uint rng)
+{
+    return rng/4294967295.0f;
+}
+
+float4 rand_uintToFloat4(uint rng)
+{
+    return float4((rng&0xFF)/255.0f, ((rng >> 8)&0xFF)/255.0f, ((rng >> 16)&0xFF)/255.0f, (rng >> 24)/255.0f);
+}
+
+// convert rng value to [-1.0, 1.0] range
+float rand_uintToFloatNeg(uint rng)
+{
+    return (rng/2147483647.0f)-1.0; 
+}
+
+// random number generator working in floating point space
+float rand_float( float2 n )
+{
+    return frac(sin(dot(n.xy, float2(12.9898, 78.233)))* 43758.5453);
+}
+
+// random float in the range [0.0, 1.0]
+float3 rand_0To1_float(inout uint rndState)
+{
+    return rand_uintToFloat(rand_lcg(rndState));
+}
+
+// random float3 in the range [0.0, 1.0]
+float3 rand_0To1_float3(inout uint rndState)
+{
+    return float3(rand_uintToFloat(rand_lcg(rndState)), rand_uintToFloat(rand_lcg(rndState)), rand_uintToFloat(rand_lcg(rndState)));
+}
+
+// random float3 in the range [-1.0, 1.0]
+float3 rand_neg1To1_float3(inout uint rndState)
+{
+	return float3(rand_uintToFloatNeg(rand_lcg(rndState)), rand_uintToFloatNeg(rand_lcg(rndState)), rand_uintToFloatNeg(rand_lcg(rndState)));
+}
+
+float3 generatePointOnSphereCapUnbiasedYUp(float capAngle, float r1, float r2)
+{
+    //Generates a point on a sphere cap
+    float3 p;
+    float r1_sqrt = sqrt(r1) * 0.5;
+    p.x = sin(r1_sqrt*capAngle)*cos(r2*PI*2.0);
+    p.y = cos(r1_sqrt*capAngle);
+    p.z = sin(r1_sqrt*capAngle)*sin(r2*PI*2.0);
+
+    return p;
+}
+
+float3 generatePointOnSphereCapUnbiasedZUp(float capAngle, float r1, float r2)
+{
+    //Generates a point on a sphere cap
+    float3 p;
+    float r1_sqrt = sqrt(r1) * 0.5;
+    p.x = sin(r1_sqrt*capAngle)*cos(r2*PI*2.0);
+    p.y = sin(r1_sqrt*capAngle)*sin(r2*PI*2.0);
+    p.z = cos(r1_sqrt*capAngle);
+
+    return p;
+}
+
+//takes the minimum of n/d and m, while also preventing div by 0
+float div_min(float n, float d, float m)
+{
+    return ((n * d) < (m * d * d)) ? (n / d) : m;
+}

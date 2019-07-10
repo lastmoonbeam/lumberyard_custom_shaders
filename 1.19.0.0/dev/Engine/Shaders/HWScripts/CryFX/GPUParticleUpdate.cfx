@@ -1,0 +1,631 @@
+#include "Common.cfx"
+#include "GPUParticle.cfi"
+#include "GPUParticleHelpers.cfi"
+#include "GPUParticleCurves.cfi"
+
+#define SHAPE_BOX (0)
+#define SHAPE_SPHERE (1)
+
+
+#define DRAG_APPROX_THRESHOLD (0.01)
+
+struct WindArea
+{
+    float4 direction_and_is_radial;
+    float4 position_and_falloff_scale;
+    float4 aabb_min_and_shape;
+    float4 aabb_max;
+    float3x4 matToLocal;
+};
+
+RWStructuredBuffer<int> ParticleState : register(u0); // per-emitter frame data
+RWStructuredBuffer<Particle> ParticleData : register(u1); // per-particle data
+RWStructuredBuffer<int> ParticleDeadlist : register(u2); // per-emitter particle dead list
+RWStructuredBuffer<float> ParticleSortDistances : register(u3); // per-particle sort score
+
+RWStructuredBuffer<float4> ParticleDeathLocations : register(u4); // locations where particles died, for parental spawn events
+
+SamplerState depthSampler : register(s5);
+Texture2D<float4> DepthBuffer : register(t5);
+
+SamplerState normalSampler : register(s6);
+Texture2D<float4> NormalMap : register(t6);
+
+SamplerState depthCubeSampler : register(s8);
+TextureCube<float4> DepthCubeMap : register(t8);
+
+StructuredBuffer<WindArea> windAreas : register(t7);
+
+float4 ParticleFrameInfo0; // .x:DeltaTime .y:Time .z:unused .w:bufferOffset
+float4 CameraPosition; // .xyz = Position
+float4 EmitterPosition; // .xyz = Position
+float4 depthCubeNearFar; // .x = depth cubemap near distance .y = depth cubemap far distance
+float4 DeadCountOffset;
+
+float4x4 ViewMatrix;
+float4x4 ProjectionMatrix;
+
+float4 ed_life_random;
+float4 ed_scalexy_random;
+float4 ed_color;
+float4 ed_positionOffset_random;
+float4 ed_drag_random;
+float4 ed_acceleration_gravity;
+float4 ed_world_position_delta;
+float4 ed_turbulence_3dspeed_size_random;
+float4 ed_turbulence_speed_random;
+float4 ed_rotationRate_rotationRateZrandom;
+float4 ed_flags_collisionRadius; // x = flags, y = collisionRadius
+
+float4 ed_target_position_radius; // xyz = target position, w = target radius
+float4 ed_target_velocity_maxObjSize; //xyz = target velocity, w = max object size, used for shrinking
+float4 ed_target_radiusRandom; // xy = orbit radius w/ randomness
+
+float4 ed_paramVelocityXYZ;
+float4 ed_paramVelocityXYZRandRange;
+float4 ed_paramVelocityXYZRandom;
+float4 ed_paramVelocityXYZRandomRandRange;
+
+float4 ed_numWindAreas_windScale; // x -> number, y -> windScale, zw -> unused
+float4 ed_globalWind; //xyz -> global wind, w ->unused
+
+float4x4 ed_world;
+float4x4 ed_world_rotation;
+float4x4 ed_inv_world;
+
+float3 VortexRotation(inout Particle p, float fTime, float fAge, float fVortexSpeed, float fTurbulenceSize)
+{
+    // Compute vortex rotational offset at current age.
+    // p(t) = TSize e^(i TSpeed t) (t max 1)
+    
+    // pi/180 = 0.017452872 (DEG2RAD constant)
+    float fAngle = (fVortexSpeed * DEG2RAD) * (fAge + fTime);
+    float fVortexSize = fTurbulenceSize;
+
+    float2 vRot;
+    vRot.x = cos(fAngle);
+    vRot.y = sin(fAngle);
+    vRot *= fVortexSize;
+
+    // Scale down vortex size in first half rotation.
+    fVortexSize *= min(abs(fAngle) / PI, 1.f);
+
+    // Choose axes orthogonal to velocity.
+    float3 vAxis = p.velocity.xyz;
+    if (length(vAxis) < EPSILON)
+        vAxis = float3(0.0, 0.0, 1.0);
+    float3 vX = cry_vecGetOrthogonal(vAxis);
+    float3 vY = cross(vX, vAxis);
+
+    return normalize(vX) * vRot.x + normalize(vY) * vRot.y;
+}
+
+void AddToDeadList(uint dispatchThreadIdX)
+{
+    // push particle index on deadlist
+    int deadIndex;
+#if METAL
+    InterlockedAdd(ParticleState[1], 1, deadIndex);
+	
+    //This clamp is here to prevent deadIndex from going outside the desired bounds. 
+    //For some reason on metal we are seeing random GPU hangs and it was tracked
+    //down to writes into ParticleDeadlist. It is theorized that for some reason 
+    //this index goes above 255 and results in out of bound writes and eventually crashing the drivers.
+    deadIndex = clamp(deadIndex, 0, 255); //255 is used here as we use 256 threads for the compute shader
+#else
+    int deadCountIndexOffset = (1 + asint(DeadCountOffset.x));
+    InterlockedAdd(ParticleState[deadCountIndexOffset], 1, deadIndex);
+#endif
+    ParticleDeadlist[deadIndex + asint(ParticleFrameInfo0.w)] = dispatchThreadIdX;
+}
+
+float GetLinearDepthFromCubemap(float3 lookupDirection)
+{
+    float mapDepth = DepthCubeMap.SampleLevel(depthCubeSampler, -lookupDirection, 0.0).x;
+
+    //unproject
+    float depthUnprojected = -(depthCubeNearFar.x * depthCubeNearFar.y) / ((depthCubeNearFar.x - depthCubeNearFar.y) * mapDepth - depthCubeNearFar.x);
+
+    return depthUnprojected;
+}
+
+//computes a distance from the geometry in the depth cubemap, used to reconstruct surface normal as the gradient
+float ComputeDistanceFromCubemap(float3 worldPosition)
+{
+    float3 lookupDirection = worldPosition - EmitterPosition.xyz;
+
+    //determine major axis and sign of major axis
+    uint majorAxis;
+    int axisSign = 1;
+
+    if (abs(lookupDirection.x) > abs(lookupDirection.y) && abs(lookupDirection.x) > abs(lookupDirection.z))
+    {
+        majorAxis = 0;
+    }
+    else if (abs(lookupDirection.y) > abs(lookupDirection.z))
+    {
+        majorAxis = 1;
+    }
+    else
+    {
+        majorAxis = 2;
+    }
+
+    if (lookupDirection[majorAxis] < 0)
+        axisSign = -1;
+
+    float depthUnprojected = GetLinearDepthFromCubemap(lookupDirection);
+    float depthPoint = axisSign * lookupDirection[majorAxis];
+
+    return depthUnprojected - depthPoint;
+}
+
+float3 ComputeCubemapGradient(float3 position)
+{
+    const float epsilon = 0.01;
+    float3 dx = float3(epsilon, 0, 0);
+    float3 dy = float3(0, epsilon, 0);
+    float3 dz = float3(0, 0, epsilon);
+
+    float d = ComputeDistanceFromCubemap(position);
+    float dfdx = ComputeDistanceFromCubemap(position + dx);
+    float dfdy = ComputeDistanceFromCubemap(position + dy);
+    float dfdz = ComputeDistanceFromCubemap(position + dz);
+
+    return normalize(float3(dfdx - d, dfdy - d, dfdz - d));
+}
+
+float3 ComputeWind(float3 pos)
+{
+    float3 resultWind = float3(0, 0, 0);
+
+#if %_RT_GPU_PARTICLE_WIND
+    resultWind += ed_globalWind;
+
+    int numAreas = asint(ed_numWindAreas_windScale.x);
+
+    for (int i = 0; i < numAreas; ++i)
+    {
+        WindArea area = windAreas[i];
+
+        float3 relative_position = pos - area.position_and_falloff_scale.xyz;
+
+        float3 offset = mul(area.matToLocal, float4(relative_position, 0)).xyz;
+        float dist = (asint(area.aabb_min_and_shape.w) == SHAPE_BOX) ? (max(max(abs(offset.x), abs(offset.y)), abs(offset.z))) : length(offset);
+
+        if (dist <= 1.0)
+        {
+            float strength = min((1.0 - dist) * area.position_and_falloff_scale.w, 1.0);
+
+            if (asint(area.direction_and_is_radial.w) && dist > 0.0)
+            {
+                strength /= length(relative_position);
+                resultWind += relative_position * (area.direction_and_is_radial.z * strength);
+            }
+            else
+            {
+                resultWind += area.direction_and_is_radial.xyz * strength;
+            }
+        }
+    }
+#endif
+
+    return resultWind;
+}
+
+
+[numthreads(256, 1, 1)]
+void CS(
+    uint3 GroupId : SV_GroupID,
+    uint3 DispatchThreadId : SV_DispatchThreadID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+    uint GroupIndex : SV_GroupIndex)
+{
+    const float DeltaTime = ParticleFrameInfo0.x;
+    const float Time = ParticleFrameInfo0.y;
+    const int bufferOffset = asint(ParticleFrameInfo0.w);
+    
+    Particle p = ParticleData[DispatchThreadId.x + bufferOffset]; // fetch current data
+    
+    p.deltaTime = DeltaTime;
+    p.life -= DeltaTime; // update lifetime
+
+    [branch]
+    if (p.life > 0.0)
+    {
+#if %_RT_MOTION_BLUR || SHAPE_NEEDS_ESTIMATED_VELOCITY
+        //save previous transformation data
+        p.previous_position_xy = p.position.xy;
+        p.previous_rotation_pos_z.w = p.position.z;
+        p.previous_rotation_pos_z.xyz = p.rotation.xyz;
+#endif
+        // sample curves
+        float particleRelativeTime = 1.0 - (p.life / p.lifeMax);
+        float particleTime = p.lifeMax - p.life;
+        float curvevalDrag = GetValueFromCurve(0, particleRelativeTime);
+        float curvevalGravity = GetValueFromCurve(1, particleRelativeTime);
+#if %_RT_GPU_PARTICLE_TURBULENCE
+        float curvevalTurbulence3DSpeed = GetValueFromCurve(4, particleRelativeTime);
+        float curvevalTurbulenceVortexSize = GetValueFromCurve(5, particleRelativeTime);
+        float curvevalTurbulenceVortexSpeed = GetValueFromCurve(6, particleRelativeTime);
+#endif
+        float curvevalRotationRateX = GetValueFromCurve(7, particleRelativeTime);
+        float curvevalRotationRateY = GetValueFromCurve(8, particleRelativeTime);
+        float curvevalRotationRateZ = GetValueFromCurve(9, particleRelativeTime);
+        float curveLifetimePivotX = GetValueFromCurve(18, particleTime);
+        float curveLifetimePivotY = GetValueFromCurve(19, particleTime);
+        float3 rotationRateLifeTimeCurve = float3(curvevalRotationRateX, curvevalRotationRateY, curvevalRotationRateZ);
+#if %_RT_GPU_PARTICLE_TARGET_ATTRACTION
+        float curvevalTargetRadius = GetValueFromCurve(22, particleRelativeTime);
+#endif
+                
+        // grab random values
+        float4 rndValues = rand_uintToFloat4(p.random0);
+        
+        // calculate vortex turbulence before integration step
+#if %_RT_GPU_PARTICLE_TURBULENCE
+        float turbulence_vortexSpeed = (ed_turbulence_speed_random.x + rndValues.z * ed_turbulence_speed_random.y) * curvevalTurbulenceVortexSpeed;
+        float turbulence_vortexSize = (ed_turbulence_3dspeed_size_random.z + rndValues.w * ed_turbulence_3dspeed_size_random.w) * curvevalTurbulenceVortexSize;
+        float3 turbulence_vortex = VortexRotation(p, 0.0, particleTime, turbulence_vortexSpeed, turbulence_vortexSize);
+#endif
+        // travel
+        float drag = (ed_drag_random.x + rndValues.x * ed_drag_random.y) * curvevalDrag; // calculate drag
+        float gravity = -9.8 * (ed_drag_random.z + rndValues.y * ed_drag_random.w) * curvevalGravity; // calculate gravity
+        
+#if %_RT_GPU_PARTICLE_TURBULENCE
+        float turbulence_3dspeed = (ed_turbulence_3dspeed_size_random.x + rndValues.y * 
+                                    ed_turbulence_3dspeed_size_random.y) * curvevalTurbulence3DSpeed;       // calculate turbulence 3d speed constant
+        turbulence_3dspeed /= sqrt(DeltaTime);                                                              // make sure it integrates correctly
+#endif
+        float3 acceleration = float3(0.0, 0.0, 0.0);
+        acceleration += float3(0.0, 0.0, gravity); // add gravity
+        acceleration += ed_acceleration_gravity.xyz; // add user defined acceleration
+
+        // add 3d turbulence
+#if %_RT_GPU_PARTICLE_TURBULENCE
+        if(turbulence_3dspeed > 0.0)
+        {
+            // calculate random numbers for acceleration based on position, multiply position with primes to create better spread
+            uint turbulenceRng = DispatchThreadId.x + asint(p.position.x)*0x2fb14c01 + asint(p.position.y) * 0x18a3354f + asint(p.position.z) * 0x07058db1;
+            acceleration += float3(rand_uintToFloatNeg(rand_lcg(turbulenceRng)), 
+                                   rand_uintToFloatNeg(rand_lcg(turbulenceRng)), 
+                                   rand_uintToFloatNeg(rand_lcg(turbulenceRng))) * turbulence_3dspeed;
+        }
+#endif
+
+        float3 position = p.position.xyz;
+        float3 velocity = p.velocity.xyz;
+
+        #if %_RT_GPU_PARTICLE_SHAPE_SPHERE || %_RT_GPU_PARTICLE_SHAPE_CIRCLE || %_RT_GPU_PARTICLE_SHAPE_POINT || %_RT_GPU_PARTICLE_SHAPE_BOX
+        {
+            float3 originalEmitterPos = float3(p.position.w, p.velocity.w, p.rotation.w);
+
+            uint rndState = p.random0;
+            rand_lcg(rndState);
+
+            float3 userRandomVelocity = (ed_paramVelocityXYZRandom.xyz + ed_paramVelocityXYZRandomRandRange.xyz * rand_0To1_float3(rndState)) * rand_neg1To1_float3(rndState);
+            float3 userVelocity = (ed_paramVelocityXYZ.xyz + ed_paramVelocityXYZRandRange.xyz * rand_0To1_float(rndState)) + userRandomVelocity;
+            float3 particleAgeVelocity = float3(GetValueFromCurve(23, particleRelativeTime),
+                                                GetValueFromCurve(24, particleRelativeTime),
+                                                GetValueFromCurve(25, particleRelativeTime));
+            float3 curvedUserVelocity = (userVelocity * particleAgeVelocity) * DeltaTime;
+
+            float3 offset = p.position.xyz - originalEmitterPos;
+
+            #if %_RT_GPU_PARTICLE_SHAPE_SPHERE
+            {
+                float radius = length(offset) + curvedUserVelocity.x;
+
+                if(radius > 0.0)
+                {
+                    float4 quatXY = quatSetRotationZ(curvedUserVelocity.y / radius);
+                    float4 quatZ = quatSetRotationY(curvedUserVelocity.z / radius);
+
+                    float4 rot = quatMul(quatXY,quatZ);
+                    float3 newPos = normalize(quatRotatePoint(rot, offset)) * radius;
+                    p.position.xyz = newPos;
+                }
+                else
+                {
+                    p.position.xyz = normalize(offset) * radius;
+                }
+                p.position.xyz += originalEmitterPos;
+            }
+            #elif %_RT_GPU_PARTICLE_SHAPE_CIRCLE
+            {
+                float radius = length(offset.xy);
+                float newRadius = radius + curvedUserVelocity.x;
+                
+                if (radius > 0.0 && newRadius > 0.0)
+                {
+                    float2 originOffset = offset.xy / radius * newRadius;
+                    float angleInRad = curvedUserVelocity.y / newRadius;
+                    
+                    float sinAngle, cosAngle;
+                    sincos(angleInRad, sinAngle, cosAngle);
+                    
+                    p.position.x = originOffset.x * cosAngle - originOffset.y * sinAngle + originalEmitterPos.x;
+                    p.position.y = originOffset.x * sinAngle + originOffset.y * cosAngle + originalEmitterPos.y;                    
+                }
+                
+                p.position.z += curvedUserVelocity.z;
+            }
+            #elif %_RT_GPU_PARTICLE_SHAPE_POINT || %_RT_GPU_PARTICLE_SHAPE_BOX
+            {
+                p.position.xyz += curvedUserVelocity;
+            }
+            #endif
+        }
+        #endif
+        
+        float3 wind = ComputeWind(p.position.xyz);
+
+#if %_RT_GPU_PARTICLE_WIND
+        drag *= ed_numWindAreas_windScale.y;
+
+        if (drag * DeltaTime >= DRAG_APPROX_THRESHOLD)
+        {
+            //math taken from Travel::Travel() in ParticleEffect.h
+            //see there for reasoning
+            float invDrag = 1.0 / drag;
+            float3 term = wind + acceleration * invDrag;
+            float decay = 1.0 - exp(-drag * DeltaTime);
+            float T = decay * invDrag;
+            p.position.xyz += p.velocity.xyz * T + term * (DeltaTime - T);
+            p.velocity.xyz = lerp(p.velocity.xyz, term, decay);
+        }
+        else
+        {
+#endif
+        acceleration += (wind - p.velocity.xyz) * drag; // add drag approximation
+            
+        p.velocity.xyz += acceleration * DeltaTime;
+            
+        p.position.xyz += p.velocity.xyz * DeltaTime;
+#if %_RT_GPU_PARTICLE_WIND
+        }
+#endif
+       
+#if %_RT_GPU_PARTICLE_TURBULENCE
+        // calculate vortex turbulence difference at new timestep & add to position (artificial motion: bypasses physics)
+        p.position.xyz += (VortexRotation(p, DeltaTime, particleTime, turbulence_vortexSpeed, turbulence_vortexSize) - turbulence_vortex);
+#endif
+        // calculate particle rotation
+        p.rotation.xyz += degreesToRadians(ed_rotationRate_rotationRateZrandom.xyz * rotationRateLifeTimeCurve * DeltaTime);
+        
+#if %_RT_GPU_PARTICLE_TARGET_ATTRACTION
+        {
+            p.position.xyz -= p.velocity.xyz * DeltaTime;
+
+            float targetRadius = max(0, (ed_target_radiusRandom.x + rndValues.w * ed_target_radiusRandom.y) * curvevalTargetRadius + ed_target_position_radius.w);
+            //get position and velocity relative to target
+            float3 relativePos = p.position.xyz - ed_target_position_radius.xyz;
+            float3 relativeVel = p.velocity.xyz - ed_target_velocity_maxObjSize.xyz;
+
+            float dist = length(relativePos);
+            float speed = length(relativeVel);
+
+            float3 radialDir = normalize(relativePos);
+            float radialSpeed = dot(relativeVel, radialDir);
+
+            float3 orbitalDir = relativeVel - radialDir * radialSpeed;
+            float orbitalSpeed = length(orbitalDir);
+            orbitalDir = normalize(orbitalDir);
+            
+            float arriveTime = div_min(targetRadius - dist, radialSpeed, F_HUGE);
+            if (arriveTime < 0)
+            {
+                arriveTime = F_HUGE;
+            }
+            //Calculates the time it would take to move a quarter around the target at the current radius, based on the current orbital velocity.
+            arriveTime = div_min(PI * 0.5 * dist * p.life, orbitalSpeed * p.lifeMax, arriveTime);
+
+            uint isTargetAttractionOrbit = getParticleFlag(p.flags, PARTICLE_FLAG_TARGET_ATTRACTION_ORBIT) && (targetRadius != 0 );
+
+            uint isTargetAttractionExtendSpeed = getParticleFlag(p.flags, PARTICLE_FLAG_TARGET_ATTRACTION_EXTEND_SPEED);
+            if (arriveTime > p.life)
+            {
+                if (isTargetAttractionExtendSpeed)
+                {
+                    arriveTime = p.life;
+                }
+            }
+            else if (!isTargetAttractionOrbit)
+            {
+                p.lifeMax -= (p.life - arriveTime);
+                p.life = arriveTime;
+            }
+
+            float newDist = 0;
+            if (arriveTime > DeltaTime)
+            {
+                radialSpeed = (targetRadius - dist) / arriveTime;
+                orbitalSpeed = sqrt(max(0, (speed * speed) - (radialSpeed * radialSpeed)));
+                newDist = dist + radialSpeed * DeltaTime;
+            }
+            else
+            {
+                radialSpeed = 0;
+                //This number is taken from CPU implementation. Please refer to Particle.cpp line 1657
+                static const float returnRate = 0.25;
+                //life_random.z has the particle's base speed parameter
+                orbitalSpeed = lerp(speed, ed_life_random.z, returnRate);
+                newDist = targetRadius;
+            }
+
+            if (newDist > 0)
+            {
+                float angularVel = orbitalSpeed * rsqrt(dist * newDist) * DeltaTime;
+    
+                float cosVal, sinVal;
+                sincos(angularVel, sinVal, cosVal);
+                p.position.xyz += (radialDir * (cosVal - 1) + orbitalDir * sinVal) * dist;
+
+                orbitalDir = orbitalDir * cosVal - radialDir * sinVal;
+                radialDir = normalize(p.position.xyz - ed_target_position_radius.xyz);
+            }
+
+            p.position.xyz += radialDir * (newDist - dist);
+            p.velocity.xyz = radialDir * radialSpeed + orbitalDir * orbitalSpeed + ed_target_velocity_maxObjSize.xyz;
+
+            if (getParticleFlag(p.flags, PARTICLE_FLAG_TARGET_ATTRACTION_SHRINK))
+            {
+                dist = newDist - targetRadius;
+                if (dist < max(p.scale.x, p.scale.y) * ed_target_velocity_maxObjSize.w)
+                {
+                    p.scale = max(dist, 0) / ed_target_velocity_maxObjSize.w;
+                }
+            }
+        }
+#endif
+
+#if %_RT_GPU_PARTICLE_DEPTH_COLLISION
+        float isColliding = 1.0;
+        
+        // if we support collision
+        float viewSpaceCollisionBias = ed_flags_collisionRadius.y * max(p.scale.x, p.scale.y);
+
+        float4 particleViewSpacePosition = mul(ViewMatrix, float4(p.position.xyz,1.0));
+        particleViewSpacePosition.z -= viewSpaceCollisionBias;
+        
+        float4 particleClipSpacePosition = mul(ProjectionMatrix, particleViewSpacePosition);
+        
+        // eliminate back projection
+        isColliding *= particleClipSpacePosition.w > 0.0 ? 1.0 : 0.0;
+            
+        // if there is still collision
+        if(isColliding == 1.0)
+        {                
+            float isCollisionFlagIgnore = float(getParticleFlag(p.flags, PARTICLE_FLAG_COLLISION_FLAG_IGNORE));
+            float isCollisionFlagDie = float(getParticleFlag(p.flags, PARTICLE_FLAG_COLLISION_FLAG_DIE));
+            float isCollisionFlagStop = float(getParticleFlag(p.flags, PARTICLE_FLAG_COLLISION_FLAG_STOP));
+        
+            float3 particlePositionNDC = ClipSpaceToNDC(particleClipSpacePosition);
+            
+            float2 particlePositionScreenUV = NDCToUV(particlePositionNDC);
+            
+            float depthSampleNDC = DepthBuffer.SampleLevel(depthSampler, particlePositionScreenUV, 0.0).x * PerView_NearFarClipDist.y;
+
+            float distance = depthSampleNDC - particleClipSpacePosition.w; 
+            isColliding = distance < 0.0 ? 1.0 : 0.0;
+            
+            // if collision flag is die on collision
+            p.life *= (1.0 - isColliding * isCollisionFlagDie);
+            
+            float3 collisionNormal = normalize(NormalMap.SampleLevel(normalSampler, particlePositionScreenUV,0.0).xyz * 2.0 - float3(1,1,1));
+                    
+            float hasBouncyness = ed_flags_collisionRadius.z > 0.0 ? 1.0 : 0.0;
+            float needToReflect = isColliding * hasBouncyness * isCollisionFlagIgnore; //either 0.0 or 1.0
+                
+            float3 reflectedVelocity = reflect(velocity * ed_flags_collisionRadius.z, collisionNormal);
+            p.velocity.xyz = p.velocity.xyz * (1.0 - needToReflect) + reflectedVelocity * needToReflect;
+            
+            p.position.xyz = p.position.xyz * (1.0 - needToReflect) * (1.0 - isColliding * isCollisionFlagStop) + (position * needToReflect) + (position * isColliding * isCollisionFlagStop);
+        }
+#elif %_RT_GPU_PARTICLE_CUBEMAP_DEPTH_COLLISION
+        
+        //look up depth from cubemap
+        //direction for cubemap lookup is from emitter to particle
+        float3 lookupDirection = p.position.xyz - EmitterPosition.xyz;
+
+        float depthUnprojected = GetLinearDepthFromCubemap(lookupDirection);
+
+        //determine major axis and sign of major axis
+        uint majorAxis;
+        int axisSign = 1;
+
+        if (abs(lookupDirection.x) > abs(lookupDirection.y) && abs(lookupDirection.x) > abs(lookupDirection.z))
+        {
+            majorAxis = 0;
+        }
+        else if (abs(lookupDirection.y) > abs(lookupDirection.z))
+        {
+            majorAxis = 1;
+        }
+        else
+        {
+            majorAxis = 2;
+        }
+
+        if (lookupDirection[majorAxis] < 0)
+            axisSign = -1;
+
+        //get world space position by scaling lookupVector to correct depth
+        float3 worldOffset = lookupDirection;
+        worldOffset *= axisSign * depthUnprojected / worldOffset[majorAxis];
+
+        float3 worldPosition = EmitterPosition.xyz + worldOffset;
+
+        //compute normal
+        float3 normal = ComputeCubemapGradient(worldPosition);
+
+        float collisionRadius = ed_flags_collisionRadius.y * max(p.scale.x, p.scale.y);
+
+        static const float epsilon = 0.01;
+
+        //if collided -> resolve
+        if ((abs(lookupDirection[majorAxis]) > depthUnprojected - collisionRadius) && (dot(normal, normalize(lookupDirection)) < -epsilon) && (length(lookupDirection) > epsilon))
+        {
+            float isCollisionFlagIgnore = float(getParticleFlag(p.flags, PARTICLE_FLAG_COLLISION_FLAG_IGNORE));
+            float isCollisionFlagDie = float(getParticleFlag(p.flags, PARTICLE_FLAG_COLLISION_FLAG_DIE));
+            float isCollisionFlagStop = float(getParticleFlag(p.flags, PARTICLE_FLAG_COLLISION_FLAG_STOP));
+
+            float needToReflect = ((ed_flags_collisionRadius.z > 0) ? 1.0 : 0.0) * isCollisionFlagIgnore;
+
+            //reflect particle
+            float3 reflectedVelocity = reflect(velocity * ed_flags_collisionRadius.z, normal);
+            p.velocity.xyz = (p.velocity.xyz * (1 - needToReflect) * (1 - isCollisionFlagStop)) + (reflectedVelocity * needToReflect);
+
+            float3 resolvedPos = worldPosition - normalize(lookupDirection) * collisionRadius;
+            p.position.xyz = (resolvedPos * needToReflect) + (resolvedPos * isCollisionFlagStop) + p.position.xyz * (1 - isCollisionFlagStop) * (1 - needToReflect);
+
+            p.life *= (1 - isCollisionFlagDie);
+        }
+        
+#endif
+
+        // store particle
+        ParticleData[DispatchThreadId.x + bufferOffset] = p; // write data
+        
+        ParticleSortDistances[DispatchThreadId.x + bufferOffset] = getSortScore(CameraPosition.xyz, p.position.xyz); // write sort data
+    }
+    else
+    {
+#if %_RT_GPU_PARTICLE_WRITEBACK_DEATH_LOCATIONS
+        //if life + dt > 0 -> just died, push onto death location list if we have children
+        if (p.life + DeltaTime >= 0)
+        {
+            int pushIdx;
+            InterlockedAdd(ParticleState[0], 1, pushIdx);
+            uint numStructs, stride;
+            ParticleDeathLocations.GetDimensions(numStructs, stride);
+            if (pushIdx < (int)numStructs)
+            {
+                ParticleDeathLocations[pushIdx] = float4(p.position.xyz, 1);
+            }
+            else
+            {
+                InterlockedAdd(ParticleState[0], -1, pushIdx);
+            }
+        }
+#endif
+        
+        //separate variation
+        AddToDeadList(DispatchThreadId.x + bufferOffset);
+        
+        // store particle
+        ParticleData[DispatchThreadId.x + bufferOffset] = p; // write data
+    
+        ParticleSortDistances[DispatchThreadId.x + bufferOffset] = 0.0;
+        return;
+    }
+}
+
+// Default technique
+technique GPUParticleUpdate
+{
+    pass p0
+    {
+        ComputeShader = CS() GPUParticleCS;
+    }
+}

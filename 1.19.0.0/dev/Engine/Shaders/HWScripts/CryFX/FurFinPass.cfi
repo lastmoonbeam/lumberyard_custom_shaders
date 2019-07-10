@@ -1,0 +1,388 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+
+// This file handles silhouette extruded fin generation for shadow passes.
+
+#include "CommonShadowGenPass.cfi"
+
+struct vert2FragFurFins
+{
+    vert2FragGeneral General;
+    float4 vNormal : TEXCOORDN;
+    float4 vBaseScreen : TEXCOORDN; // Base fur strand position in screen proj coords
+    float4 vTipScreen : TEXCOORDN; // Tip (outermost shell) fur strand position in screen proj coords
+    float4 vFurData : TEXCOORDN; // xyz is vertex frame movement; w is scaled fur length
+
+#if !%_RT_HW_PCF_COMPARE || %_RT_CUBEMAP0
+    float Depth  : TEXCOORDN;
+#endif
+};
+
+vert2FragFurFins FurFinsVS(app2vertGeneral IN)
+{
+    streamPos vertPassPos = (streamPos)0;
+    vertPassPos.CustomData.shellDistance = 0.0;
+    vertPassPos.CustomData.bPrevPass = false;
+    #if %FUR_VERT_COLORS
+        vertPassPos.CustomData.vFurCombWorld = IN.vertCommon.Color.xyz;
+        vertPassPos.CustomData.furLengthScale = IN.vertCommon.Color.w;
+    #endif
+
+    vert2FragFurFins OUT = (vert2FragFurFins)0;
+    vs_shared_output(IN, OUT.General, vertPassPos, true);
+
+    // Output HPosition as world space, GS will multiply by viewproj
+    OUT.General.HPosition = vertPassPos.WorldPos;
+    OUT.General.HPosition.xyz -= PerView_WorldViewPos.xyz;
+    OUT.General.vView = normalize(OUT.General.vView);
+
+#if %CUSTOM_MODIFICATOR && %_RT_GPU_PARTICLE_TURBULENCE
+    // With Custom modificator and GPU Particle Turbulence defined the normal (in world space) will be
+    // calculated by _pos_HPos() and modified by CustomModificator() to apply other things that
+    // might affect the normal for fur, like gravity or wind.
+    OUT.vNormal = float4(vertPassPos.CustomData.vNormal, 0);
+#else
+    // Otherwise we calculate the normal in world space ourselves as it's expected to be valid by the Geometry Shader.
+    float3 vNormWS = vertPassPos.ObjToTangentSpace[2];
+    vNormWS = mul((const float3x3)vertPassPos.InstMatrix, vNormWS);
+    vNormWS = normalize(vNormWS);
+    OUT.vNormal = float4(vNormWS, 0);
+#endif
+       
+    OUT.vFurData.w = GetFurLengthMeters();
+    #if %FUR_VERT_COLORS
+        OUT.vFurData.w *= IN.vertCommon.Color.w;
+    #endif
+
+    float4 HPos = mul(PerView_ViewProjZeroMatr, vertPassPos.CustomData.vBaseWorld);
+    OUT.vBaseScreen = HPosToScreenTC(HPos);
+
+    HPos = mul(PerView_ViewProjZeroMatr, vertPassPos.CustomData.vTipWorld);
+    OUT.vTipScreen = HPosToScreenTC(HPos);
+
+    return OUT;
+}
+
+void AdjustShadowDepth(inout vert2FragFurFins vert, bool bShadowPass)
+{
+    if (bShadowPass)
+    {
+#if !%_RT_CUBEMAP0 
+    #if !%_RT_NEAREST
+        vert.General.HPosition.z /= PerShadow_FrustumInfo.y; //use linear z-buffer
+    #endif
+    #if !%_RT_HW_PCF_COMPARE
+        //perspective interpolation is not needed here
+        vert.Depth = vert.General.HPosition.z - PerShadow_FrustumInfo.z; //increase precision around camera
+    #endif
+    #if !%_RT_NEAREST
+        vert.General.HPosition.z *= vert.General.HPosition.w; //HPosition.z is linearized already
+    #endif
+#else
+    vert.Depth = (vert.General.HPosition.z / PerShadow_FrustumInfo.y);
+    vert.Depth += fDepthTestBias.x;
+#endif
+    }
+}
+
+vert2FragFurFins LerpFinStruct(vert2FragFurFins s1, vert2FragFurFins s2, float t)
+{
+    vert2FragFurFins Out = (vert2FragFurFins)0;
+    Out.General.HPosition = lerp(s1.General.HPosition, s2.General.HPosition, t);
+    Out.General.baseTC = lerp(s1.General.baseTC, s2.General.baseTC, t);
+    Out.General.vView = lerp(s1.General.vView, s2.General.vView, t);
+    Out.General.screenProj = lerp(s1.General.screenProj, s2.General.screenProj, t);
+    Out.vNormal = lerp(s1.vNormal, s2.vNormal, t);
+    Out.vBaseScreen = lerp(s1.vBaseScreen, s2.vBaseScreen, t);
+    Out.vTipScreen = lerp(s1.vTipScreen, s2.vTipScreen, t);
+    Out.vFurData = lerp(s1.vFurData, s2.vFurData, t);
+#if !%_RT_HW_PCF_COMPARE || %_RT_CUBEMAP0
+    Out.Depth = lerp(s1.Depth, s2.Depth, t);
+#endif
+    return Out;
+}
+
+vert2FragFurFins PlaneSegmentIntersection(float3 n, float3 p, float3 p0, vert2FragFurFins l0, vert2FragFurFins l1)
+{
+    float3 l = l1.General.HPosition.xyz - l0.General.HPosition.xyz;
+    float lDotN = dot(l, n);
+
+    // To handle lDotN == 0, clamp near 0, calling code will distance sort to discard bad results
+    lDotN = (step(0, lDotN) * 2 - 1) * max(abs(lDotN), 1e-6);
+
+    float t = dot(p0 - l0.General.HPosition.xyz, n) / lDotN;
+    return LerpFinStruct(l0, l1, t);
+}
+
+void PlaneTriangleIntersection(float3 n, float3 p, float3 p0, vert2FragFurFins v1, vert2FragFurFins v2, vert2FragFurFins v3, inout vert2FragFurFins out1, inout vert2FragFurFins out2)
+{
+    vert2FragFurFins intersections[3] = { (vert2FragFurFins)0, (vert2FragFurFins)0, (vert2FragFurFins)0 };
+    intersections[0] = PlaneSegmentIntersection(n, p, p0, v1, v2);
+    intersections[1] = PlaneSegmentIntersection(n, p, p0, v2, v3);
+
+    // Sort first two entries
+    uint closerIndex = step(distance(intersections[0].General.HPosition.xyz, p), distance(intersections[1].General.HPosition.xyz, p));
+    vert2FragFurFins temp = intersections[1 - closerIndex];
+    intersections[1] = intersections[closerIndex];
+    intersections[0] = temp;
+
+    intersections[2] = PlaneSegmentIntersection(n, p, p0, v3, v1);
+
+    // Sort 3rd entry into list
+    closerIndex = 1 - step(distance(intersections[1].General.HPosition.xyz, p), distance(intersections[2].General.HPosition.xyz, p));
+    temp = intersections[closerIndex + 1];
+    intersections[2] = intersections[2 - closerIndex];
+    intersections[1] = temp;
+
+    closerIndex = step(distance(intersections[0].General.HPosition.xyz, p), distance(intersections[1].General.HPosition.xyz, p));
+    temp = intersections[1 - closerIndex];
+    intersections[1] = intersections[closerIndex];
+    intersections[0] = temp;
+
+    // Two nearest intersections form the basis for our billboarded quad
+    out1 = intersections[0];
+    out2 = intersections[1];
+}
+
+void EmitBaseTriangle(float4x4 ViewProjMatr, bool bShadowPass, triangle vert2FragFurFins In[3], inout TriangleStream<vert2FragFurFins> OutStream)
+{
+    In[0].General.HPosition = mul(ViewProjMatr, In[0].General.HPosition);
+    AdjustShadowDepth(In[0], bShadowPass);
+    In[0].vFurData.w = 0;
+    OutStream.Append(In[0]);
+    In[1].General.HPosition = mul(ViewProjMatr, In[1].General.HPosition);
+    AdjustShadowDepth(In[1], bShadowPass);
+    In[1].vFurData.w = 0;
+    OutStream.Append(In[1]);
+    In[2].General.HPosition = mul(ViewProjMatr, In[2].General.HPosition);
+    AdjustShadowDepth(In[2], bShadowPass);
+    In[2].vFurData.w = 0;
+    OutStream.Append(In[2]);
+    OutStream.RestartStrip();
+}
+
+void AddOrthogonalFins(float4x4 ViewProjMatr, bool bShadowPass, triangle vert2FragFurFins In[3], inout TriangleStream<vert2FragFurFins> OutStream)
+{
+#if !%_RT_GPU_PARTICLE_SHADOW_PASS
+    // Determine if the orthogonality of the three normals to the view changes sign
+    float3 nDotView;
+    nDotView.x = dot(In[0].vNormal.xyz, In[0].General.vView.xyz);
+    nDotView.y = dot(In[1].vNormal.xyz, In[1].General.vView.xyz);
+    nDotView.z = dot(In[2].vNormal.xyz, In[2].General.vView.xyz);
+
+    int normalSigns = sign(nDotView.x) + sign(nDotView.y) + sign(nDotView.z);
+    float isSilhouette = 1 - step(3, abs(normalSigns)); // 1 if tri is on the silhouette, 0 if it's fully front/back facing
+
+    // First, get center point of triangle
+    float4 ptCenter = (In[0].General.HPosition + In[1].General.HPosition + In[2].General.HPosition) / 3;
+
+    // Compute normal of the triangle face
+    float3 p10 = In[1].General.HPosition.xyz - In[0].General.HPosition.xyz;
+    float3 p20 = In[2].General.HPosition.xyz - In[0].General.HPosition.xyz;
+    float3 triNormal = cross(p10, p20);
+    triNormal = normalize(triNormal);
+
+    // Compute view orthogonal vector that lies on the triangle plane
+    float3 vView = (In[0].General.vView.xyz + In[1].General.vView.xyz + In[2].General.vView.xyz) / 3;
+    float3 vViewOrtho = cross(vView, triNormal);
+    vViewOrtho = normalize(vViewOrtho);
+
+    // Compute view-oriented vector that lies on the triangle. This is the normal for our plane
+    float3 vViewOnTri = cross(vViewOrtho, triNormal);
+        
+    float3 planeP0 = vViewOnTri * dot(ptCenter.xyz, vViewOnTri);
+    float planeD = -dot(ptCenter.xyz, vViewOnTri);
+
+    vert2FragFurFins segment1 = (vert2FragFurFins)0;
+    vert2FragFurFins segment2 = (vert2FragFurFins)0;
+    PlaneTriangleIntersection(vViewOnTri, ptCenter.xyz, planeP0, In[0], In[1], In[2], segment1, segment2);
+
+    float4 segment1Pos = segment1.General.HPosition;
+    float4 segment2Pos = segment2.General.HPosition;
+    #if !%_RT_HW_PCF_COMPARE || %_RT_CUBEMAP0
+        float segment1Depth = segment1.Depth;
+        float segment2Depth = segment2.Depth;
+    #endif
+
+    // Scale segment lengths by isSilhouette to force non-silhouette fins to be degenerate
+    float segment1Length = segment1.vFurData.w * isSilhouette;
+    float segment2Length = segment2.vFurData.w * isSilhouette;
+    const float c_finExpansionSlop = 0.25; // Add some slop to ensure fins do not have any gaps. Determined empirically
+    segment1Pos.xyz += (segment1Pos.xyz - ptCenter.xyz) * c_finExpansionSlop;
+    segment2Pos.xyz += (segment2Pos.xyz - ptCenter.xyz) * c_finExpansionSlop;
+
+    if (bShadowPass)
+    {
+        EmitBaseTriangle(ViewProjMatr, bShadowPass, In, OutStream);
+    }
+
+    segment1.vFurData.w = 0;
+    segment1.General.HPosition = mul(ViewProjMatr, segment1Pos);
+    AdjustShadowDepth(segment1, bShadowPass);
+    OutStream.Append(segment1);
+    segment2.vFurData.w = 0;
+    segment2.General.HPosition = mul(ViewProjMatr, segment2Pos);
+    AdjustShadowDepth(segment2, bShadowPass);
+    OutStream.Append(segment2);
+
+    #if !%_RT_HW_PCF_COMPARE || %_RT_CUBEMAP0
+        segment1.Depth = segment1Depth;
+        segment2.Depth = segment2Depth;
+    #endif
+
+    segment1.vFurData.w = 1;
+    segment1.General.HPosition = mul(ViewProjMatr, segment1Pos + segment1.vNormal * segment1Length);
+    AdjustShadowDepth(segment1, bShadowPass);
+    OutStream.Append(segment1);
+    segment2.vFurData.w = 1;
+    segment2.General.HPosition = mul(ViewProjMatr, segment2Pos + segment2.vNormal * segment2Length);
+    AdjustShadowDepth(segment2, bShadowPass);
+    OutStream.Append(segment2);
+#else
+    if (bShadowPass)
+    {
+        EmitBaseTriangle(ViewProjMatr, bShadowPass, In, OutStream);
+    }
+#endif
+}
+
+[maxvertexcount(4)]
+void FurFinsGS(triangle vert2FragFurFins In[3], inout TriangleStream<vert2FragFurFins> OutStream)
+{
+    AddOrthogonalFins(PerView_ViewProjZeroMatr, false, In, OutStream);
+}
+
+pixout FurFinsPS(vert2FragFurFins IN)
+{
+    fragPassCustom pFurPass = (fragPassCustom)0;
+    pFurPass.vFurData = IN.vFurData;
+
+    half strandPercent = ComputeFurStrandPercent(furHeightmapSampler, IN.General.baseTC, IN.vFurData.w);
+    pFurPass.alpha = 1.0 - strandPercent * strandPercent;
+    clip(pFurPass.alpha - FurFinAlphaTest);
+
+    pFurPass.vBaseScreen = AdjustFurBaseSampleTC(IN.vBaseScreen);
+    pFurPass.vTipScreen = AdjustFurTipSampleTC(IN.vTipScreen);
+
+    // Cannot use strandPercent from above for albedo attenuation, since alpha-blended edges of fur strands will
+    // never apply self-shadowing color. Instead, use inverse square distance from base as a good alternative
+    pFurPass.albedoAtten = 1.0 - IN.vFurData.w;
+    pFurPass.albedoAtten = 1.0 - pFurPass.albedoAtten * pFurPass.albedoAtten;
+
+    return FurPSInternal(IN.General, pFurPass);
+}
+
+technique FurFins
+{
+    pass p0
+    {
+        VertexShader = FurFinsVS();
+        GeometryShader = FurFinsGS();
+        PixelShader = FurFinsPS();
+
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = None;
+        AlphaBlendEnable = false;
+    }
+}
+
+vert2FragFurFins FurShadowVS(app2vertSGGeneral IN)
+{
+    streamPos vertPassPos = (streamPos)0;
+    vertPassPos.CustomData.shellDistance = 0.0;
+    vertPassPos.CustomData.bPrevPass = false;
+    #if %FUR_VERT_COLORS
+        vertPassPos.CustomData.vFurCombWorld = IN.vertCommon.Color.xyz;
+        vertPassPos.CustomData.furLengthScale = IN.vertCommon.Color.w;
+    #endif
+    streamPos_FromSG(IN, vertPassPos);
+    
+    vert2FragFurFins OUT = (vert2FragFurFins)0;
+    static const float4x4 MatrixIdentity =
+    {
+        float4(1,0,0,0),
+        float4(0,1,0,0),
+        float4(0,0,1,0),
+        float4(0,0,0,1)
+    };
+    OUT.General.HPosition = Pos_VS_Shadow(MatrixIdentity, vertPassPos); // Do not provide ViewProj here, GS will handle it
+    OUT.General.baseTC = float4(IN.vertCommon.baseTC, 0, 0);
+
+    OUT.General.vView.xyz = vertPassPos.WorldPos.xyz - PerShadow_LightPos.xyz;
+    OUT.General.vView = normalize(OUT.General.vView);
+#if %CUSTOM_MODIFICATOR && %_RT_GPU_PARTICLE_TURBULENCE
+    // With Custom modificator and GPU Particle Turbulence defined the normal (in world space) will be
+    // calculated by _pos_HPos() and modified by CustomModificator() to apply other things that
+    // might affect the normal for fur, like gravity or wind.
+    OUT.vNormal = float4(vertPassPos.CustomData.vNormal, 0);
+#else
+    // Otherwise we calculate the normal in world space ourselves as it's expected to be valid by the Geometry Shader.
+    float3 vNormWS = vertPassPos.ObjToTangentSpace[2];
+    vNormWS = mul((const float3x3)vertPassPos.InstMatrix, vNormWS);
+    vNormWS = normalize(vNormWS);
+    OUT.vNormal = float4(vNormWS, 0);
+#endif
+
+    OUT.vFurData.w = GetFurLengthMeters();
+    #if %FUR_VERT_COLORS
+        OUT.vFurData.w *= IN.vertCommon.Color.w;
+    #endif
+
+    float4 OutBaseTC;
+    _ModifyUV_1(vertPassPos.baseTC, OutBaseTC, vertPassPos.Position );
+    OUT.General.baseTC.xy = OutBaseTC;
+
+    return OUT;
+}
+
+[maxvertexcount(7)]
+void FurShadowGS(triangle vert2FragFurFins In[3], inout TriangleStream<vert2FragFurFins> OutStream)
+{
+    AddOrthogonalFins(PerView_ViewProjMatr, true, In, OutStream);
+}
+
+pixout_shadow FurShadowPS(vert2FragFurFins IN)
+{
+    half strandPercent = ComputeFurStrandPercent(furHeightmapSampler, IN.General.baseTC, IN.vFurData.w);
+    strandPercent = 1.0 - strandPercent * strandPercent;
+
+    clip(strandPercent - FurFinAlphaTest);
+
+    pixout_shadow OUT = (pixout_shadow)0;
+    OUT.Color = half4(0, 0, 0, 0);
+
+#if !%_RT_HW_PCF_COMPARE
+	OUT.Color.rgba = IN.Depth; //FIX: depth output should be here for precision
+#else
+	#if %_RT_CUBEMAP0
+		//output linear depth
+		OUT.Depth = IN.Depth;
+	#endif
+#endif
+
+    return OUT;
+}
+
+technique FurShadowGen
+{
+    pass p0
+    {
+        VertexShader = FurShadowVS();
+        GeometryShader = FurShadowGS();
+        PixelShader = FurShadowPS();
+
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = None;
+    }
+}

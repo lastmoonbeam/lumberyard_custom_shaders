@@ -1,0 +1,1671 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Source File.
+//  Shader extension
+//  Copyright (C), Crytek Studios, 2001-2004.
+// -------------------------------------------------------------------------
+//  File name:   ShadeLib.cfi
+//  Version:     v1.00
+//  Created:     19/05/2006 by Tiago Sousa
+//  Compilers:
+//  Description: Common BRDF's/shading utilities library
+//
+// -------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////
+
+// Common Samplers //////////////////////
+
+DIFFUSEMAP
+NORMALMAP
+HEIGHTMAP
+SPECULARMAP
+SMOOTHNESSMAP
+SCENEDEPTHMAP
+
+sampler2D diffuseMapSampler_Decal
+{
+    Texture = $Diffuse;
+    AddressU = Border;
+    AddressV = Border;
+    BorderColor = {0, 0, 0, 0};
+    sRGBLookup = true;
+};
+
+sampler2D detailMapSampler = sampler_state
+{
+    Texture = $Detail;
+};
+
+// Deferred Shading Samplers /////////////
+
+SCENE_NORMALS_MAP
+SCENE_NORMALS_BENT
+SCENE_DIFFUSEACC_MAP
+SCENE_SPECULARACC_MAP
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define REFLECT_OFF    0
+#define REFLECT_CUBE   1
+#define REFLECT_SPHERE 2
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Shared fragment-shading pass structure ////////////////////////////
+
+struct fragInput
+{
+    // input attribute data
+    float4 baseTC;
+#if %BLENDLAYER
+    // Un-modulated texture coordinates used by blend map and modulated blend layer texture coordinates used by 2nd diffuse, 2nd height, etc.
+    float2 blendMapTC;
+    float2 blendLayerTC;
+#endif
+#if %EMITTANCE_MAP
+    float2 emittanceTC;
+    float2 emissiveIntensityTC;
+#endif
+#if %DETAIL_MAPPING
+    float2 detailTC;
+#endif
+    float4 basesectorTC;
+    float4 bumpTC;
+    float4 terrainDetailTC;
+
+    half4 vTangent;
+    half4 vBinormal;
+    half4 vNormal;
+    half4 vView;
+
+    float4 screenProj;
+    float4 projTC;
+
+    half4 Color;
+    half4 Color1;
+    float4 VisTerrainCol;
+    float4 SunRefl;
+    half4 Ambient;
+
+    float3 DistAtten;
+    float4 AvgFogVolumeContrib;
+
+    float4 OutdoorAOInfo;
+
+    uint uSample;
+};
+
+struct fragPass
+{
+    fragInput IN;
+
+    // Usage flags fo shared stuff
+    bool bCustomComposition;      // dont use shared final shading composition
+    bool bRenormalizeNormal;
+    bool bDontUseBump;
+    bool bDetailBumpMapping;
+    bool bDetailBumpMappingMasking;
+    bool bVertexColors;      // apply vertex color to final result
+    bool bApplyGI;
+    bool bDeferredSpecularShading;
+    bool bSkipDirectLighting;
+    int  nReflectionMapping; // reflection mapping type (0: off, 1: cube map, 2: spherical)
+
+    int  nMicroDetailQuality;
+    half fBumpHeightScale;
+    half fHeightBias;
+    half fSelfShadowStrength;
+
+    half2 vDetailBumpTiling; // detail diffuse_bump mapping tiling
+    half2 vDetailBlendAmount; // detail diffuse and gloss blend scale
+    half fDetailBumpScale;       // detail mapping scale
+
+    half blendFac;          // per-pixel layer blending factor
+
+    // shared fields
+    int nQuality;           // shader quality level
+
+    half3x3 mTangentToWS;  // tangent to world space transformation matrix - might be required for some vectors
+    half3 vView;           // eye vector, fFogFrac
+    half3 vNormal;         // normal vector
+    half3 vNormalDiffuse;  // diffuse normal vector
+    half3 vReflVec;        // reflection vector
+
+    half3 cBumpMap;        // tangent space normal map
+    half4 cDiffuseMap;     // diffuse map
+    half4 cSpecularMap;    // specular map
+    half3 cEnvironment;    // environment map
+    half4 cShadowOcclMap;  // shadow map
+
+    half fNdotE;           // per pass constant NdotE
+    half fGloss;           // gloss/roughness
+    half fAlpha;           // opacity
+    half fAlphaTestRef;    // instanced alpha test value
+
+    // Deferred rendering RTs (multisampling friendly - check frag_get_deferred_buffers in fraglib.cfi for example usage in your custom shader)
+    half4 cNormalMapRT;
+    half4 cDiffuseAccRT;
+    half4 cSpecularAccRT;
+    half fSceneDepthRT;
+
+    // Shading accumulation
+    half3 cAmbientAcc;
+    half3 cDiffuseAcc;
+    half3 cBackDiffuseAcc;
+    half3 cSpecularAcc;
+
+    // Custom per pass data
+    fragPassCustom pCustom;
+};
+
+struct fragLightPass
+{
+    int nType;         // light type
+    half3 cDiffuse;    // light diffuse color
+    half3 cSpecular;   // light specular color
+    half3 cFilter;     // light filter color
+    half3 vLight;      // light vector
+    half3 vLightWS;    // light position
+
+    half fNdotL;       // normal dot light
+    half fFallOff;     // light attenuation
+    half fOcclShadow;  // light shadow term
+
+    half3 cOut;        // light final contribution
+
+    // ... Custom per light data ...
+    fragLightPassCustom pCustom;
+};
+
+
+//------------------------------------------------------------------------
+//                        Common shading utilities
+//------------------------------------------------------------------------
+
+#define     MIN_ROUGHNESS   0.001h
+#define     FLOAT_EPSILON   1e-10
+#define     HALF_EPSILON    1e-5
+//------------------------------------------------------------------------
+// assumes 0 is min
+half smoothstep_opt(in half maxi, in half x)
+{
+    x = saturate( x / maxi );
+    return  x * x  * (3.0 - 2.0 * x);
+}
+
+half GlossToSpecExp255(in half gloss)
+{
+    return gloss * 255.h;
+}
+
+half GetFresnel(half NdotI, half bias, half power)
+{
+    half facing = (1.0 - NdotI);
+    return saturate(bias + (1-bias)*pow(facing, power));
+}
+
+half3 GetEnvmapFresnel(half3 specCol0, half gloss, half fNdotE)
+{
+    const half3 specCol90 = half3( 1, 1, 1 );
+
+    // Empirical approximation to the reduced gain at grazing angles for rough materials
+    return lerp( specCol0, specCol90, pow( 1 - saturate( fNdotE ), 5 ) / (40 - 39 * gloss) );
+}
+
+half3 GetEnvBRDFFresnel(half3 specCol0, half gloss, half fNdotV, in sampler2D sampEnvBRDF)
+{
+    // Use a LUT that contains the numerically integrated BRDF for given N.V and smoothness parameters
+    // x: integral for base reflectance 0.0, y: integral for base reflectance 1.0
+
+    half2 envBRDF = tex2Dlod( sampEnvBRDF, float4( fNdotV, gloss, 0, 0 ) ).xy;
+    return lerp( envBRDF.xxx, envBRDF.yyy, specCol0 );
+}
+
+half GetAttenuation(half3 L, half fInvRadius, bool bUserFalloff = false, half fFalloffMax = 1.0h)
+{
+    half3 vDist = L * fInvRadius;
+    half fFallOff = saturate(1 + dot(vDist, -vDist));
+
+    if( bUserFalloff )
+        fFallOff = smoothstep_opt( fFalloffMax, fFallOff);
+
+  return fFallOff;
+}
+
+half GetPhysicalLightAttenuation(half fDist, half fInvRadius, half fAttenuationBulbSize)
+{
+    const half radius = 1 / fInvRadius;
+    half d = fDist;
+
+    // Fadeout last 20% of radius
+    half fadeoutFactor = saturate((radius - d) * (fInvRadius / 0.2h));
+
+    // Light attenuation model: 1 / (1 + d/lightsize)^2
+    d = max(d - fAttenuationBulbSize, 0);
+    const float epsilon = 1e-6;
+    float denom = 1 + d / (fAttenuationBulbSize + epsilon);
+    half fAttenuation = fadeoutFactor * fadeoutFactor / (denom * denom);
+
+    return fAttenuation;
+}
+
+half GetSpotAttenuation(half fPdotL, half fCosAngle, half fRadius)
+{
+    // Compute cosine of spot direction and light.
+    half fSpotFalloff = fCosAngle / (fPdotL+1e-6); // 1 alu
+
+    // Apply planar falloff and computed spot falloff.
+    half fFallOff = 1.0h - pow(saturate(fSpotFalloff), fRadius); //  4 alu
+
+    return fFallOff;
+}
+
+float3 MapCubeToSphere(float3 pos)
+{
+    float3 pos2 = pos.xyz * pos.xyz;
+    return pos * sqrt(1 - 0.5 * pos2.yzx - 0.5 * pos2.zxy + 0.333 * pos2.yzx * pos2.zxy);
+}
+
+half3 ShiftVector(half3 V, half3 N, half shiftAmount)
+{
+    return normalize(V + shiftAmount * N);
+    // 3 alu, 1 mad
+}
+
+// optimized shift vector - skips normalization - use only when vector lenght not relevant
+half3 ShiftVectorOpt(half3 V, half3 N, half shiftAmount)
+{
+    return (V + shiftAmount * N);
+    // 1 mad
+}
+
+##if AZ_RESTRICTED_PLATFORM
+    ##define AZ_RESTRICTED_SECTION 1
+    ##include_restricted(shadeLib_cfi, AZ_RESTRICTED_PLATFORM)
+##endif
+##if AZ_RESTRICTED_SECTION_IMPLEMENTED
+    ##undef AZ_RESTRICTED_SECTION_IMPLEMENTED
+##else
+#if %ST_LLVM_DIRECTX_SHADER_COMPILER
+    // LLVM DirectX Shader Compiler doesn't have support for halfs yet. At the moment we are replacing all halfs
+    // with floats using regular expresions, making this function being declared twice and failing to compile the shader.
+#else
+half3 ToAccurateSRGB(half3 col)
+{	
+    return (col < 0.0031308) ? 12.92h * col : 1.055h * pow(col, 1.0h / 2.4h) - half3(0.055h, 0.055h, 0.055h);
+}
+#endif
+##endif
+
+float3 ToAccurateSRGB(float3 col)
+{	
+    return (col.xyz < 0.0031308) ? 12.92 * col.xyz : 1.055 * pow( col.xyz, 1.0 / 2.4 ) - float3( 0.055, 0.055, 0.055 );
+}
+
+float3 ToAccurateLinear(float3 col)
+{	
+    return (col.xyz < 0.04045h) ? col.xyz / 12.92h : pow ((col.xyz + float3(0.055h, 0.055h, 0.055h)) / float3(1.055h, 1.055h, 1.055h), 2.4h);
+}
+
+float3 LinearToSRGB( float3 col)
+{
+    //We can also modify this funtion and it's name in future to support for P3, Rec709 and Rec2020
+#if %_RT_SRGB0
+    return ToAccurateSRGB(col);
+#elif %_RT_SRGB1
+    return pow(col,1/2.2f);
+#elif %_RT_SRGB2
+    return sqrt(col);
+#else
+    //Default: return the most accurate curve
+    return ToAccurateSRGB(col);
+#endif
+}
+
+##if AZ_RESTRICTED_PLATFORM
+    ##define AZ_RESTRICTED_SECTION 2
+    ##include_restricted(shadeLib_cfi, AZ_RESTRICTED_PLATFORM)
+##endif
+##if AZ_RESTRICTED_SECTION_IMPLEMENTED
+    ##undef AZ_RESTRICTED_SECTION_IMPLEMENTED
+##else
+#if %ST_LLVM_DIRECTX_SHADER_COMPILER
+    // LLVM DirectX Shader Compiler doesn't have support for halfs yet. At the moment we are replacing all halfs
+    // with floats using regular expresions, making this function being declared twice and failing to compile the shader.
+#else
+half3 LinearToSRGB( half3 col)
+{
+    //We can also modify this funtion and it's name in future to support for P3, Rec709 and Rec2020
+#if %_RT_SRGB0
+    return ToAccurateSRGB(col);
+#elif %_RT_SRGB1
+    return pow(col,1/2.2h);
+#elif %_RT_SRGB2
+    return sqrt(col);
+#else
+    //Default: return the most accurate curve
+    return ToAccurateSRGB(col);
+#endif
+}
+#endif
+##endif
+
+float3 SRGBToLinear( float3 col)
+{
+    //We can also modify this funtion and it's name in future to support for P3, Rec709 and Rec2020
+#if %_RT_SRGB0
+    return ToAccurateLinear(col);
+#elif %_RT_SRGB1
+    return pow(col,2.2f);
+#elif %_RT_SRGB2
+    return pow(col, 2.0f);
+#else
+    //Default: return the most accurate curve
+    return ToAccurateLinear(col);
+#endif
+}
+//////////////////////////////// Common HDR encoding/decoding ////////////////////////////////
+
+#define MAX_FLOAT                        128.h
+
+#define fHDR_EXP_BASE_1_04    1.04h
+#define fHDR_EXP_BASE_1_06    1.06h
+#define fHDR_EXP_OFFSET            128.h
+
+// Using RGBK format (multiplier in alpha - filtering should work fine)
+// quality: good
+half4 EncodeRGBK(in half4 Color, const half fMultiplier, bool bUsePPP = false)
+{
+    const half4 cScale = half4(half3(1.h, 1.h, 1.h) / fMultiplier, 1.h / 255.0);
+    half fMax = saturate(dot(half4(Color.rgb, 1.h), cScale));   // 1 alu
+
+    Color.a = ceil(fMax * 255.h) / 255.h;                       // 3 alu
+
+    Color.xyz /= Color.a * fMultiplier;                         // 2alu
+
+    if( bUsePPP )
+    {
+        //Color *= rsqrt( Color ); // for best quality
+        Color.a = sqrt( Color.a ); // encode just multiplier for performance reasons
+    }
+
+    return Color;
+}
+
+void EncodeRGBKPair(inout half4 Color0, inout half4 Color1, const half fMultiplier, bool bUsePPP = false)
+{
+    half fMax0 = saturate(dot(Color0.rgb, 1.h / fMultiplier));    // 1 alu
+    half fMax1 = saturate(dot(Color1.rgb, 1.h / fMultiplier));    // 1 alu
+
+    Color0.a = ceil(fMax0 * 255.h) / 255.h;                       // 3 alu
+    Color1.a = ceil(fMax1 * 255.h) / 255.h;                       // 3 alu
+
+    Color0.xyz /= Color0.a * fMultiplier;                         // 2alu
+    Color1.xyz /= Color1.a * fMultiplier;                         // 2alu
+
+    if( bUsePPP )
+    {
+        //Color0 *= rsqrt( Color0 ); // for best quality
+        //Color0 *= rsqrt( Color0 );
+
+        Color0.a = sqrt( Color0.a ); // encode just multiplier for performance reasons
+        Color1.a = sqrt( Color1.a );
+
+    }
+}
+
+half4 DecodeRGBK(in half4 Color, const half fMultiplier, bool bUsePPP= false)
+{
+    if( bUsePPP )
+    {
+        //Color.rgb *= Color.rgb * (Color.a * Color.a) * fMultiplier;
+        Color.rgb *= (Color.a * Color.a) * fMultiplier;
+    }
+    else
+    {
+        Color.rgb *= Color.a * fMultiplier;
+    }
+    return Color;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// These functions are used for each and every manipulation with compressed HDR buffer
+
+#define SCENE_HDR_MULTIPLIER 32.h
+
+half4 EncodeHDRBuffer( in half4 color )
+{
+    return color;
+}
+
+void EncodeLightBufferPair( inout half4 diffuse, inout half4 specular )
+{
+}
+
+half4 DecodeHDRBuffer( in half4 rgbk )
+{
+    return rgbk;
+}
+
+half4 EncodeLightBuffer( in half4 color )
+{
+    return color;
+}
+
+half4 Decode7E3F(in half4 color)
+{
+    // Reference
+    //vColor.rgb *= 8.0f;  // Shift performed in resolve and tex bias
+    //float3 e = floor( vColor.rgb );
+    //float3 m = frac( vColor.rgb );
+    //vColor.rgb  = (e == 0.0f) ? 2*m/8 : (1+m)/8 * pow(2,e);
+
+    float3 me = color.xyz;
+    float3 e  = floor(me);
+    float3 m  = frac(me);
+
+    color.xyz = (e == 0.0f) ? 2.0f * m : (1.0f+m) * exp2(e);
+    color.xyz *= 0.125f;
+
+    return color;
+}
+
+half4 DecodeLightBuffer( in half4 color , bool bRangeAdaptHDR = false)
+{
+    return color;
+}
+
+//////////////////////////////// Common Brdfs ////////////////////////////////
+//-------------------------------------------------------------------------
+// Our roughness is always square inverse smoothness: m = (1 - smooth)^2
+// Disney's roughness for G is different: m = (0.5 + rough/2)^2
+//-------------------------------------------------------------------------
+half SmoothnessToRoughness(half smoothness, half minRoughness)
+{
+    // The min value will prevent getting too small lights
+    return max( (1.0f - smoothness) * (1.0f - smoothness), minRoughness);
+}
+
+half RoughnessToSmoothness(half roughness)
+{
+    return 1.0f - sqrt(roughness);
+}
+
+//////////////////////////////// Phong model /////////////////////////////////////
+// - Phong model has good properties for plastic and some metallic surfaces.
+// - Good for general use. Very cheap.
+
+#define ONE_OVER_PI 0.31831h
+#define ONE_OVER_TWO_PI 0.159155h
+
+// Optimized phong, use if mirrowed reflection vector pre-computed
+half Phong(half3 R, half3 L, half Exp)
+{
+    half fNormFactor = Exp * ONE_OVER_TWO_PI + ONE_OVER_TWO_PI;        // 1 ALU
+    return fNormFactor *  pow(saturate(dot(L, R)), Exp);                    // 4 ALU
+    // 5 ALU
+}
+
+half Phong(half3 N, half3 V, half3 L, half Exp)
+{
+    half3 R = reflect(-V, N);    // 3 ALU
+    return Phong(R, L, Exp);    // 5 ALU
+    // 8 ALU
+}
+
+//////////////////////////////// Blinn BRDF model /////////////////////////////////////
+// - Blinn model has good properties for plastic and some metallic surfaces.
+// - Good for general use. Very cheap.
+// *NOTE* We should also multiply by the clamped N.L factor. However this is
+// delegated to the shader part for performance reasons
+
+half BlinnBRDF(half3 N, half3 V, half3 L, half Gloss)
+{
+    half3 H = normalize(V + L);
+
+    // Compute perceptually linear exponent in range 2-2048
+    half power = exp2( 10.0h * Gloss + 1.0h );
+
+    half fNormFactor = power * (1.0/8.0) + (2.0/8.0);
+    return fNormFactor * pow( saturate( dot( N, H ) ), power );
+}
+
+//-------------------------------------------------------------------------
+// GGX NDF:
+// Spec Cry (optimized) = NormFactor * rough2 / [cos2 * (rough2 - 1) + 1]^2
+// Spec GGX =      NormFactor / [cos2 * rough2 + sin2]^2   AND  sin2 = 1 - cos2  
+//            -->  NormFactor / [cos2 * rough2 + 1 - cos2]^2
+//            -->  NormFactor / [cos2 * (rough2 - 1) + 1]^2
+//-------------------------------------------------------------------------
+float NDF_GGX(float3 N, float3 H, float roughSq, float normalizationFactor)
+{
+    float   NdotH = saturate(dot(N, H));
+    float   SpecGGX = NdotH * (NdotH * roughSq - NdotH) + 1.0;	// 2 mad ops
+    SpecGGX = normalizationFactor * roughSq / max((SpecGGX * SpecGGX), FLOAT_EPSILON );
+
+    return SpecGGX;
+}
+
+//-------------------------------------------------------------------------
+// Calculate the correlated Smith G term (geometry occlusion / shadowing)
+//-------------------------------------------------------------------------
+float G_CorrelatedSmith(float3 N, float3 V, float3 L, float m2 )
+{
+    float   NdotL = saturate(dot(N, L));
+    float   NdotV = abs(dot(N, V));
+    float   Gv = NdotL * sqrt((-NdotV * m2 + NdotV) * NdotV + m2);
+    float   Gl = NdotV * sqrt((-NdotL * m2 + NdotL) * NdotL + m2);
+    float   SmithG = 0.5h / max(Gv + Gl, FLOAT_EPSILON);
+
+    return SmithG;
+}
+
+//-------------------------------------------------------------------------
+// Calculate the final Fresnel taking into account micro occlusions occuring below F0 = 0.02
+// Following Schuler in ShaderX7
+//-------------------------------------------------------------------------
+float3 Fresnel( float3 L, float3 H, float3 F0 )
+{
+    float   F90 = saturate(dot(F0, 0.33333f) / 0.02f);
+    float3  finalFresnel = lerp(F0, F90, pow(1 - saturate(dot(L, H)), 5));
+
+    return finalFresnel;
+}
+
+//-------------------------------------------------------------------------
+float3 SpecularBRDF( half roughness, float3 N, float3 V, float3 L, float3 F0, float normalizationFactor )
+{
+    float   m2 = roughness * roughness;
+    float3  H = normalize( V + L );
+    
+    // The PBR terms
+    float   NDF = NDF_GGX( N, H, m2, normalizationFactor);  // NDF
+    float   G = G_CorrelatedSmith(N, V, L, m2);             // G - Correlated Smith Visibility Term (including Cook-Torrance denominator)
+    float3  fresnel = Fresnel(L, H, F0);                    // Fresnel (Schlick approximation + micro occlusion)
+ 
+    // Final specular term - normalization factors 1 / ((N*V)*(N*L) accounted for in the G term.
+    float3   finalSpecular = NDF * G * fresnel;
+
+    return finalSpecular;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Kaplanyan Average Normal -> half vector approximation
+
+float3 GetAverageQuadNormal(int2 PixelPos, float3 N)
+{
+    // Calculates the average normal for the current2x2pixel quad in the Gbuffer
+    // fill pass.  This is done using ddx / ddy instructions on the geometric normal(with no normal maps applied).
+    N -= ddx_fine(N) * (half(PixelPos.x & 1) - 0.5);
+    N -= ddy_fine(N) * (half(PixelPos.y & 1) - 0.5);
+    return N;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Kaplanyan Filterting Rect
+
+float2 GetKaplanyanFilteringRect(half3x3 TangentToWS, int2 PixelPos)
+{
+    // Shading frame
+    float3 T = TangentToWS[0];
+    float3 ShFrameN = normalize(TangentToWS[2]);
+    float3 ShFrameS = normalize(T - ShFrameN * dot(ShFrameN, T));
+    float3 ShFrameT = cross(ShFrameN, ShFrameS);
+
+    // Use average quad normal as a half vector
+    float3 hppW = GetAverageQuadNormal(PixelPos, ShFrameN);
+
+    // Compute half vector in parallel plane
+    hppW /= dot(ShFrameN, hppW);
+    float2 hpp = float2(dot(hppW, ShFrameS), dot(hppW, ShFrameT));
+
+    // Compute filtering rectangle
+    float2 filteringRectange = (abs(ddx_fine(hpp)) + abs(ddy_fine(hpp))) * 0.5;
+
+    // For grazing angles where the first order footprint goes to very high values
+    half epsilon = 1e-5h;
+    half roughnessMaxFootprint = RoughnessMaxFootprint + epsilon;
+    float2 AgaaKaplanyanRoughnessMaxFootprint = float2(roughnessMaxFootprint, roughnessMaxFootprint);
+    filteringRectange = min(AgaaKaplanyanRoughnessMaxFootprint, filteringRectange);
+    return filteringRectange;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Kaplanyan Roughness
+
+float GetKaplanyanRoughness(half3x3 TangetToWS, int2 PixelPos, float roughness)
+{
+    float2 filteringRectange = GetKaplanyanFilteringRect(TangetToWS, PixelPos);
+
+    // Covariance matrix of pixel filter's Gaussian (remapped in roughness units)
+    // Need x2 because roughness = sqrt(2) * pixel_sigma_hpp
+    float2 covarianceMatrix = filteringRectange * filteringRectange * 2.0f * RoughnessBoost;
+
+    // Since we have an isotropic roughness to output we conservatively take
+    // the largest edge of the filtering rectangle
+    float maxIsotropicEdge = max(covarianceMatrix.x, covarianceMatrix.y);
+
+    // Return Beckmann proxy convolution for GGX
+    return sqrt(roughness * roughness + maxIsotropicEdge);
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Anisotropic Kajiya Kay model
+
+half KajiyaKayAnisotropic(half3 T, half3 H, half Exp)
+{
+    half TdotH = dot( T, H );
+    half fSpec = sqrt( max( 1.0 - TdotH * TdotH, 0.01) );
+
+    return pow( fSpec, Exp );
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Area Light Models
+
+#define AREA_LIGHT_SPHERE        0
+#define AREA_LIGHT_RECTANGLE    1
+
+float SphereNormalization( float len, float lightSize, float m )
+{
+    // Compute the normalization factors.
+    // Note: just using sphere normalization (todo: come up with proper disk/plane normalization)
+    float dist = saturate(lightSize / len);
+    float normFactor = m / saturate( m + 0.5 * dist );
+    return normFactor * normFactor;
+}
+
+half3 SphereLight(half3 R, half3 L, half m, half4x4 mAreaLightMatr)
+{
+    const half epsilon = 1e-6;
+
+    // Intersect the sphere.       
+    half radius = mAreaLightMatr[3].y;
+
+    // Calculate centerToRay which is the vector from the center of the light projected on R.
+    // NOTE: L is not normalized, it contains the vector from position to the center of the light.
+    R = normalize(R);
+    half3 LProjectedOnR = max(abs(dot(L, R)), epsilon) * R; // Absolute is necessary to keep LProjectedOnR with the same direction as R
+    half3 centerToRay = LProjectedOnR - L;
+    half centerToRayLength = length(centerToRay);
+    half3 centerToRayNorm = centerToRay / centerToRayLength;
+
+    // Calculate a new Light vector that represents the sphere light depending on
+    // its instersection with R:
+    //     - If R doesn't instersect with the sphere (centerToRayLength greater than radius)
+    //       use the closest point on the sphere, that's L moved towards centerToRay with the radius length.
+    //     - If R does instersect with the sphere (centerToRayLength smaller than radius) use R vector with the right length,
+    //       that's the same as L moved towards centerToRay with a length of the original projection (centerToRayLength).
+    // Keeping the correct length for the new L is important because it's going to be used to calculate the energy
+    // normalization (SphereNormalization) later.
+    half distanceFromCenter = min(centerToRayLength, radius);
+    half3 newLFromSphere = L + centerToRayNorm * distanceFromCenter;
+    return newLFromSphere;
+}
+
+half3 RectangleLight(half3 R, half3 L, half m, half4x4 mAreaLightMatr)
+{
+    const half epsilon = 1e-6;
+
+    // Use the inverse of light front as the normal for the light plane,
+    // this way it faces the same directions of R and L.
+    half3 lightNormal = -mAreaLightMatr[0].xyz;
+
+    // Intersect the plane.
+    half RdotN = dot(lightNormal, R) + epsilon;
+    half intersectLen = dot(lightNormal, L) / RdotN;
+    half3 I = R * intersectLen - L;
+
+    // Project the intersection to 2D and clamp it to the light radius to get a point inside or on the edge of the light.
+    half2 lightPos2D = half2( dot(I, mAreaLightMatr[1].xyz), dot(I, mAreaLightMatr[2].xyz) );
+    half2 lightClamp2D = clamp(lightPos2D, -mAreaLightMatr[3].xy, mAreaLightMatr[3].xy);
+
+    // New light direction.
+    half3 newLFromRectangle = L + (mAreaLightMatr[1].xyz * lightClamp2D.x) + (mAreaLightMatr[2].xyz * lightClamp2D.y);
+    return newLFromRectangle;
+}
+
+float4 AreaLightIntersection( half roughness, half3 N, half3 V, half3 L, half4x4 areaLightMatrix, int lightType )
+{
+    float4 lightVec = half4(L.xyz, 1.0f);
+    half3 R = reflect(-V, N);
+
+    [branch] if( lightType == AREA_LIGHT_RECTANGLE )
+        lightVec.xyz = RectangleLight(R, L, roughness, areaLightMatrix);
+    else
+        lightVec.xyz = SphereLight(R, L, roughness, areaLightMatrix);
+
+    // Normalize.
+    half len = max(length( lightVec.xyz ),  1e-6);
+    lightVec.xyz /= len;
+
+    // Energy normalization
+    lightVec.w = SphereNormalization( len, lightType == AREA_LIGHT_RECTANGLE ? length(areaLightMatrix[3].xy) : areaLightMatrix[3].y, roughness );
+
+    return lightVec;
+}
+
+half3 AreaLightGGX( half roughness, half3 N, half3 V, half3 L, half3 SpecCol, half4x4 areaLightMatrix, int lightType)
+{
+    float4 lightVec = AreaLightIntersection(roughness, N, V, L, areaLightMatrix, lightType );
+    return SpecularBRDF(roughness, N, V, lightVec.xyz, SpecCol, lightVec.w);    // notice the normalization factor
+}
+
+// Diffuse BRDFs
+
+half3 ComputeNearestLightOnRectangle(half3 vPosition, half3 vLightPoint, float4x4 mAreaLightMatr)
+{
+    // Calculate light space plane.
+    half3 vLightDir = dot(mAreaLightMatr[0].xyz, vLightPoint.xyz) * mAreaLightMatr[0].xyz - vLightPoint.xyz;
+
+    // Calculate the nearest point.
+    half2 vSurfArea = float2(dot(vLightDir.xyz, mAreaLightMatr[1].xyz), dot(vLightDir.xyz, mAreaLightMatr[2].xyz));
+    half2 vSurfAreaClamp = clamp(vSurfArea.xy, -mAreaLightMatr[3].xy, mAreaLightMatr[3].xy); // 1 alu
+    half3 vNearestPoint = mAreaLightMatr[1].xyz * vSurfAreaClamp.x + (mAreaLightMatr[2].xyz * vSurfAreaClamp.y);
+
+    return vLightPoint.xyz + vNearestPoint.xyz;
+}
+
+half OrenNayarBRDF( half roughness, half3 N, half3 V, half3 L, half NdotL)
+{
+    // Map GGX to Oren-Nayar roughness (purely empirical remapping)
+    half    m = roughness * roughness * roughness;
+
+    // Approximation of the full quality Oren-Nayar model
+    half s = dot(L, V) - dot(N, L) * dot(N, V);
+    half t = s <= 0 ? 1 : max(max(dot(N, L), dot(N, V)), 1e-6);
+    half A = 1.0h / (1.0h + (0.5h - 2.0h / (3.0h * PI)) * m);
+    half B = m * A;
+
+    return NdotL * max(A + B * (s / t), 0);
+}
+
+half BurleyBRDF( half roughness, half NdotL, half NdotV, half VdotH)
+{
+    NdotV = max(NdotV, 0.1);  // Prevent overly dark edges
+
+    // Burley BRDF with renormalization to conserve energy
+    half energyBias = 0.5 * roughness;
+    half energyFactor = lerp(1, 1 / 1.51, roughness);
+    half fd90 = energyBias + 2.0 * VdotH * VdotH * roughness;
+    half scatterL = lerp(1, fd90, pow(max(1 - NdotL, 0.0), 5));
+    half scatterV = lerp(1, fd90, pow(max(1 - NdotV, 0.0), 5));
+
+    return scatterL * scatterV * energyFactor * NdotL;
+}
+
+#if GLES3
+// Using "halfs" for the light direction causes visual artifacts on Mali GPUs
+half DiffuseBRDF( half roughness, half3 N, half3 V, float3 L, half NdotL)
+#else
+half DiffuseBRDF( half roughness, half3 N, half3 V, half3 L, half NdotL)
+#endif
+{
+    half VdotH = saturate(dot(V, normalize(V + L)));
+    half NdotV = abs(dot(N, V));
+
+    // Burley BRDF with renormalization to conserve energy
+    return BurleyBRDF(roughness, NdotL, NdotV, VdotH);
+}
+
+half3 ThinTranslucencyBRDF(half3 N, half3 L, half3 transmittanceColor)
+{
+    half w = lerp(0, 0.5, GetLuminance(transmittanceColor));
+    half wn = rcp((1 + w) * (1 + w));
+    half NdotL = dot(N, L);
+    half transmittance = saturate((-NdotL + w) * wn);
+    half diffuse = saturate((NdotL + w) * wn);
+
+    return transmittanceColor * transmittance + diffuse;
+}
+
+
+////////////////////////////////////////////////////////////////////////////
+// Occlusion
+
+half DeriveSpecularOcclusion(half fNdotV, half aoAmount, half smoothness)
+{
+    // Derive specular occlusion term form ambient occlusion:
+    //   Rough surfaces receive full ambient occlusion
+    //   Smooth surfaces get more occlusion at grazing angles and less at normal incidence
+
+#if METAL
+    // saturate(pow(fNdotV + aoAmount, smoothness) gets translated with a log instruction in Metal
+    // we must insure that the log instruction does not take a negative value as input
+    // since this will result in "-/+Inf" which will corrupt the buffer
+    float tmp = max(1e-8, fNdotV + aoAmount);
+    return saturate(pow(tmp, smoothness) - 1 + aoAmount);
+#else
+    return saturate(pow(fNdotV + aoAmount, smoothness) - 1 + aoAmount);
+#endif
+}
+
+
+//////////////////////////////// Vegetation shading ////////////////
+
+// Common vegetation shading
+
+half3 LeafShadingBack(half3 vEye, half3 vLight, half3 vNormal, half3 cDiffBackK, half backViewDep)
+{
+    half EdotL=saturate(dot(vEye.xyz, -vLight.xyz));
+
+    // Tweaked NdotL wrapping - Artists request
+    half fLdotNBack=saturate(dot(vNormal.xyz, vLight.xyz)*0.6+0.4);
+
+    half powEdotL = EdotL*EdotL;
+    powEdotL *= powEdotL;
+
+    half3 vBackShading = saturate(powEdotL*backViewDep + (1.0-backViewDep) * fLdotNBack);
+
+    return vBackShading * cDiffBackK.xyz;
+}
+
+void LeafShadingFront(half3 vEye, half3 vLight, half3 vNormal, half3 cDifK, half3 cSpecK, inout half3 outDif, inout half3 outSpec, half fGloss)
+{
+    half fLdotNFront=dot(vNormal.xyz, vLight.xyz);
+    // Compute front diffuse term
+#if %GRASS
+    outDif=max(fLdotNFront, 0.5)*cDifK.xyz;
+#else
+    outDif=saturate(fLdotNFront)*cDifK.xyz;
+#endif
+    // compute specular if necessary
+#if !%GRASS
+    outSpec = BlinnBRDF(vNormal, vEye, vLight, fGloss) * saturate(fLdotNFront) * cSpecK.xyz;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Parallel view opacity falloff (for close to parallel leaf polys)
+
+float ParallelOpacityFalloff(float3 vWorldPos, float3 vNormal, float fCapOpacityFalloff, float fAlphaTest)
+{
+    half3 inverseViewVec = normalize(vWorldPos.xyz); // we use the abs of the dot on next line, so direction of view vec doesn't matter
+    half parallelViewOpacity = abs(dot(inverseViewVec, vNormal));
+
+    // cos(alpha ramp start angle) = 0.05
+    // cos(alpha ramp end angle) = 0.3
+    const half a = 1.0h / (0.3h - 0.05h);
+    const half b = -0.05h / (0.3h - 0.05h);
+
+    half x = parallelViewOpacity;
+
+    x = saturate(x*a + b); // remap alpha ramp range to [0..1]
+    //x *= (2.0h - x); // eval 2nd order polynomial
+
+    parallelViewOpacity = max(x, fCapOpacityFalloff);
+
+    return 1.0f + parallelViewOpacity * (fAlphaTest - 1.0f);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Layer blending
+
+half GetLayerBlendingValue(in sampler2D blendMapSampler, in float2 uv, in float lod, in half vtxAlpha, in half blendFactor, in half blendFalloff, bool bTerrainLayer = false)
+{
+    #if !ENABLE_TESSELLATION && !%SILHOUETTE_PARALLAX_OCCLUSION_MAPPING // TODO: find way to compute lod without gradients as they cause pixel artifacts at fin / shell transition
+        half4 blendMap = GetTexture2D(blendMapSampler, uv);
+    #else
+        half4 blendMap = GetTexture2DLod(blendMapSampler, float4(uv, 0, lod));
+    #endif
+
+    // Terrain layers are a particular case of blend layer, where blendmap is the heightmap and blending
+    // is only valid on transition from full opaque (vtx alpha = 1) to fully transparent (vtx alpha = 0)
+    if( bTerrainLayer )
+        blendMap = saturate(saturate(vtxAlpha*2-1) + blendMap.x); // 2 inst
+
+    half blendFac = vtxAlpha * blendMap.r * (1 + blendFactor);
+    blendFac = saturate(pow(blendFac, blendFalloff));
+    return blendFac;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Silhouette POM, POM & OBM tex coord gen
+
+float4 ComputeBarycentricCorrespondence(in float3 wsPos, in float3 wsTriPos[3], in float3 wsTriDispl[3]) // WS -> TS
+{
+    float w = 0.0;
+    float stepsize = 0.5;
+
+    float3 p0, p1, p2;
+    float3 u, v, n, d;
+
+##if AZ_RESTRICTED_PLATFORM
+    ##define AZ_RESTRICTED_SECTION 3
+    ##include_restricted(shadeLib_cfi, AZ_RESTRICTED_PLATFORM)
+##endif
+    for (int i=0; i<10; ++i)
+    {
+        p0 = wsTriPos[0] + w * wsTriDispl[0];
+        p1 = wsTriPos[1] + w * wsTriDispl[1];
+        p2 = wsTriPos[2] + w * wsTriDispl[2];
+
+        u = p1 - p0;
+        v = p2 - p0;
+        n = cross(u, v);
+        d = wsPos - p0;
+
+        const float dist = dot(n, d);
+        w += (dist > 0.0) ? stepsize : -stepsize;
+        stepsize *= 0.5;
+    }
+
+    float oneOver4ASquared = 1.0 / dot(n, n);
+    float2 bary_uv = float2(dot(cross(d, v), n), dot(cross(u, d), n)) * oneOver4ASquared;
+
+    return float4(1.0 - dot(bary_uv, float2(1, 1)), bary_uv, w);
+}
+
+struct CbcWsRes
+{
+    float3 wsPos;
+    float3 wsNorm;
+};
+
+CbcWsRes ComputeBarycentricCorrespondence(in float4 bary, in float3 wsTriPos[3], in float3 wsTriDispl[3]) // TS to WS
+{
+    const float3 disp = wsTriDispl[0].xyz * bary.x + wsTriDispl[1].xyz * bary.y + wsTriDispl[2].xyz * bary.z;
+    const float3 pos = wsTriPos[0].xyz * bary.x + wsTriPos[1].xyz * bary.y + wsTriPos[2].xyz * bary.z + disp * bary.w;
+
+    CbcWsRes res;
+    res.wsPos = pos;
+    res.wsNorm = normalize(disp);
+
+    return res;
+}
+
+struct SilMapRes
+{
+    float2 uvHitPos;
+    float4 baryHitPos;
+};
+
+SilMapRes SilhouetteMap(in const float3 wsTriPos[3], in const float3 wsTriDispl[3], in const float4 wsClipPlane[5], in const float3 wsViewDir, in const float3 texGenU, in const float3 texGenV, in float lod, in float numSteps, in float displacement)
+{
+    const float stepSize = 1.0 / clamp(numSteps, 1.f, 512.f);
+
+    const float3 wsStartPos = wsViewDir;
+    float3 wsEndPos = wsStartPos;
+    {
+        float tEnd = 1e8;
+        for (int i=0; i<5; i++)
+        {
+            const float3 o = wsStartPos;
+            const float3 d = wsViewDir;
+
+            const float denom = dot(wsClipPlane[i].xyz, d);
+            //if (denom > 0)
+            {
+                const float t = (wsClipPlane[i].w - dot(wsClipPlane[i].xyz, o)) / denom;
+                if (denom > 0 && t < tEnd)
+                {
+                    wsEndPos.xyz = o + d * t;
+                    tEnd = t;
+                }
+            }
+        }
+    }
+
+    const float4 baryStart = ComputeBarycentricCorrespondence(wsStartPos, wsTriPos, wsTriDispl);
+    const float4 baryEnd = ComputeBarycentricCorrespondence(wsEndPos, wsTriPos, wsTriDispl);
+
+    const float3 uvStart = float3(dot(texGenU, baryStart.xyz), dot(texGenV, baryStart.xyz), baryStart.w);
+    const float3 uvEnd = float3(dot(texGenU, baryEnd.xyz), dot(texGenV, baryEnd.xyz), baryEnd.w);
+    const float3 uvDeltaStep = (uvEnd - uvStart) * stepSize;
+
+    float stepped = 0;
+    float4 uv = float4(uvStart, lod);
+
+    float height = GetTexture2DLod(heightMapSampler, uv).r;
+
+    if (height < uv.z)
+    {
+        {
+            for (; stepped < 1.0; stepped += stepSize)
+            {
+                [flatten]
+                if (height >= uv.z)
+                    break;
+
+                uv.xyz += uvDeltaStep;
+
+                height = GetTexture2DLod(heightMapSampler, uv).r;
+            }
+
+            clip(height - uv.z + 0.001);
+        }
+
+        {
+            float pivot = -0.5;
+            float bstep = 0.5;
+
+            for (int i=0; i<10; i++)
+            {
+                const float3 lookup = uv.xyz + pivot * uvDeltaStep;
+                bstep *= 0.5;
+
+                height = GetTexture2DLod(heightMapSampler, float4(lookup, uv.w)).r;
+
+                pivot += (height >= lookup.z) ? -bstep : bstep;
+            }
+
+            uv.xyz += uvDeltaStep * pivot;
+            stepped += stepSize * pivot;
+        }
+    }
+
+    SilMapRes res;
+    res.uvHitPos = uv.xy;
+    res.baryHitPos = baryStart + (baryEnd - baryStart) * stepped;
+
+    return res;
+}
+
+#if %BLENDLAYER
+// baseTC2 already contain any tiling that was done / required
+float4 ParallaxOcclusionMap(in float2 baseTC, in float2 baseTC2, in float lod, in float3 viewDirNrm, in int numSteps, in float displacement, in float bias, in float blendLayerFactor)
+#else
+float4 ParallaxOcclusionMap(in float2 baseTC, in float lod, in float3 viewDirNrm, in int numSteps, in float displacement, in float bias, in float blendLayerFactor)
+#endif
+{
+    float step =  1.0 / numSteps;
+    float bumpScale = displacement;
+
+    // we need to prevent the delta to become too small according to the z view direction, 0.2 value is when the vector becomes too "parallel" to the surface, and delta too small.
+    float2 delta =  float2(viewDirNrm.x, viewDirNrm.y) * bumpScale / (max(-viewDirNrm.z, 0.2) * numSteps);
+
+    baseTC -= (1.0 - bias) * numSteps * delta;
+
+    #if %BLENDLAYER
+        baseTC2 -= (1.0 - bias) * numSteps * delta;
+    #endif
+
+    float NB0 = GetTexture2D(heightMapSampler, baseTC).r;
+#if %BLENDLAYER
+    float NB02 = GetTexture2D(HeightMap2Sampler, baseTC2.xy).r;
+    NB0 += blendLayerFactor * (NB02 - NB0);
+#endif
+
+    float height = 1 - step;
+    float4 offset = float4(baseTC + delta, 0, lod);
+    #if %BLENDLAYER
+        float4 offset2 = float4(baseTC2 + delta, 0, lod);
+    #endif
+
+    float NB1 = GetTexture2D(heightMapSampler, offset.xy).r;
+#if %BLENDLAYER
+    float NB12 = GetTexture2D(HeightMap2Sampler, offset2.xy).r;
+    NB1 += blendLayerFactor * (NB12 - NB1);
+#endif
+
+    for (int iStep=0; iStep<numSteps; iStep++)
+    {
+        [flatten]
+        if (NB1 >= height)
+            break;
+
+        NB0 = NB1;
+
+        height -= step;
+        offset.xy += delta;
+    #if %BLENDLAYER
+        offset2.xy += delta;
+    #endif
+
+        NB1 = GetTexture2DLod(heightMapSampler, offset).r;
+    #if %BLENDLAYER
+        NB12 = GetTexture2DLod(HeightMap2Sampler, float4(offset2.xy, offset2.zw)).r;
+        NB1 += blendLayerFactor * (NB12 - NB1);
+    #endif
+    }
+
+    float4 offsetBest = offset;
+    #if %BLENDLAYER
+        float4 offsetBest2 = offset2;
+    #endif
+    float error = 1.0;
+
+    float t1 = height;
+    float t0 = t1 + step;
+
+    float delta1 = t1 - NB1;
+    float delta0 = t0 - NB0;
+
+    float4 intersect = float4(delta * numSteps, delta * numSteps + baseTC);
+    #if %BLENDLAYER
+        float4 intersect2 = float4(delta * numSteps, delta * numSteps + baseTC2);
+    #endif
+
+    float t = 0;
+
+    for (int i=0; i<10; i++)
+    {
+        [flatten]
+        if (abs(error) <= 0.01)
+            break;
+
+        float denom = delta1 - delta0;
+        t = (t0 * delta1 - t1 * delta0) / denom;
+        offsetBest.xy = -t * intersect.xy + intersect.zw;
+    #if %BLENDLAYER
+        offsetBest2.xy = -t * intersect2.xy + intersect2.zw;
+    #endif
+        
+        float NB = GetTexture2DLod(heightMapSampler, offsetBest).r;
+    #if %BLENDLAYER
+        float NB2 = GetTexture2DLod(HeightMap2Sampler, float4(offsetBest2.xy, offsetBest2.zw)).r;
+        NB += blendLayerFactor * (NB2 - NB);
+    #endif
+
+        error = t - NB;
+        if (error < 0)
+        {
+            delta1 = error;
+            t1 = t;
+        }
+        else
+        {
+            delta0 = error;
+            t0 = t;
+        }
+    }
+
+#if %BLENDLAYER
+    return float4(offsetBest.xy, offsetBest2.xy);
+#else
+    return float4(offsetBest.xy, 0.0f, 0.0f);
+#endif
+}
+
+#if %BLENDLAYER
+// baseTC2 already contain any tiling that was done / required
+float4 OffsetMap(in float2 baseTC, float2 baseTC2, in half3 viewDirNrm, in int numSteps, in half displacement, in half bias, in half blendLayerFactor)
+#else
+float4 OffsetMap(in float2 baseTC, in half3 viewDirNrm, in int numSteps, in half displacement, in half bias, in half blendLayerFactor)
+#endif
+{
+    half offset = -bias * displacement;
+    float3 newCoords = float3(baseTC, 0);
+#if %BLENDLAYER
+    float3 newCoords2 = float3(baseTC2, 0);
+#endif
+    for (int i=0; i<numSteps; ++i)
+    {
+        half nz = GetNormalMap(normalMapSampler, newCoords.xy).z;
+        half h = GetTexture2D(heightMapSampler, newCoords.xy).r;
+
+#if %BLENDLAYER
+        const float2 blendLayerCoords = newCoords2.xy;
+        nz += blendLayerFactor * (GetNormalMap(BumpMap2Sampler, blendLayerCoords.xy).z - nz);
+        h += blendLayerFactor * (GetTexture2D(HeightMap2Sampler, blendLayerCoords.xy).r - h);
+#endif
+
+        half height = h * displacement + offset;
+        newCoords += (height - newCoords.z) * nz * viewDirNrm;
+#if %BLENDLAYER
+        newCoords2 += (height - newCoords2.z) * nz * viewDirNrm;
+#endif
+    }
+
+#if %BLENDLAYER
+    return float4(newCoords.xy, newCoords2.xy);
+#else
+    return float4(newCoords.xy, 0, 0);
+#endif
+}
+
+#define MICRO_DETAIL_QUALITY_DEF 0
+#define MICRO_DETAIL_QUALITY_OBM 1
+#define MICRO_DETAIL_QUALITY_POM 2
+#define MICRO_DETAIL_QUALITY_SPM 3
+
+void GetMicroDetailParams(out int mdQuality, out half mdDisplacement, out half mdHeightBias, out half mdSelfShadowStrength)
+{
+    mdQuality = MICRO_DETAIL_QUALITY_DEF;
+    mdDisplacement = 0.0h;
+    mdHeightBias = 1.0h;
+    mdSelfShadowStrength = 0.0h;
+
+#if %OFFSET_BUMP_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+    int shQuality = GetShaderQuality();
+    #if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+        //if (shQuality > QUALITY_HIGH) // explicity ensured through ALLOW_SILHOUETTE_POM flag
+        {
+            mdQuality = MICRO_DETAIL_QUALITY_SPM;
+            mdDisplacement = SilPomDisplacement;
+            mdHeightBias = HeightBias;
+            mdSelfShadowStrength = SelfShadowStrength;
+            return;
+        }
+    #endif
+
+    #if %OFFSET_BUMP_MAPPING && %PARALLAX_OCCLUSION_MAPPING
+        if (shQuality > QUALITY_MEDIUM)
+        {
+            mdQuality = MICRO_DETAIL_QUALITY_POM;
+            mdDisplacement = PomDisplacement;
+        }
+        else if (shQuality == QUALITY_MEDIUM)
+        {
+            mdQuality = MICRO_DETAIL_QUALITY_OBM;
+            mdDisplacement = ObmDisplacement;
+        }
+    #elif %PARALLAX_OCCLUSION_MAPPING
+        if (shQuality > QUALITY_MEDIUM)
+        {
+            mdQuality = MICRO_DETAIL_QUALITY_POM;
+            mdDisplacement = PomDisplacement;
+        }
+    #elif %OFFSET_BUMP_MAPPING
+        if (shQuality > QUALITY_LOW)
+        {
+            mdQuality = MICRO_DETAIL_QUALITY_OBM;
+            mdDisplacement = ObmDisplacement;
+        }
+    #endif
+
+    mdHeightBias = HeightBias;
+    mdSelfShadowStrength = SelfShadowStrength;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// EnvMap Samplers
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half4 DecodeHDRCubemap(half4 color)
+{
+    return color;
+}
+
+half4 GetEnvironmentCMap(samplerCUBE envMap, in half3 envTC, in half fGloss)
+{
+    const half numCMapMips = 6.0;  // TODO: Use real cubemap size
+
+    half fGlossinessLod = numCMapMips - fGloss * numCMapMips;
+    half4 envColor = DecodeHDRCubemap(texCUBElod( envMap, half4(envTC, fGlossinessLod) ));
+
+    return envColor;
+}
+
+half4 GetEnvironment2DMap(sampler2D envMap, in half2 envTC)
+{
+    half4 envColor = tex2D(envMap, envTC.xy);
+
+    return envColor;
+}
+
+void CubemapBoxParallaxCorrection(inout half3 vReflVec, in half3 vPosition, in half3 vLightPos, in half3 vBoxExtentsMin, in half3 vBoxExtentsMax, inout half fGloss)
+{
+    // Parallax correction for local cubemaps using a box as geometry proxy
+
+    half3 vReflVecN = normalize(vReflVec.xyz);
+
+    // Min/max intersection
+    half3 vBoxIntersectionMax = ((vLightPos + vBoxExtentsMax) - vPosition) / vReflVecN;
+    half3 vBoxIntersectionMin = ((vLightPos + vBoxExtentsMin) - vPosition) / vReflVecN;
+
+    // Intersection test
+    half3 vFurthestPlane = vReflVecN > 0.0f ? vBoxIntersectionMax : vBoxIntersectionMin;
+    half fDistance = min(min(vFurthestPlane.x, vFurthestPlane.y), vFurthestPlane.z);
+
+    // Apply new reflection position
+    half3 vInterectionPos = vPosition + vReflVecN * fDistance;
+    vReflVec = vInterectionPos - vLightPos;
+
+    // Modulate glossiness based on reflection vector length.
+    //half3 vDist = vBoxPos - vPosition;
+    //half fSqrLen = 1.h - saturate(dot(vDist, vDist));
+    //fGloss = lerp(fGloss, 1.h, saturate(fGloss * fSqrLen));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// HDR output
+
+half3 SimpleReinhardTonemap( float3 color)
+{
+    return color / (color + float3(1.0, 1.0, 1.0));
+}
+
+void HDRFogOutput( out pixout OUT, half4 Color, half fDepth, half3 FogColor, half fFogFactor )
+{
+    Color.xyz = lerp(FogColor.xyz, Color.xyz, fFogFactor);
+    OUT.Color = Color;
+
+#ifdef %ST_FIXED_POINT
+    //Since we don't have floating point render targets and the engine doesn't support an LDR pass
+    //we do a quick tonemap to avoid burning the lighting.
+   OUT.Color.rgb = SimpleReinhardTonemap(OUT.Color.rgb);
+#endif
+
+}
+
+void HDROutput( out pixout OUT, half4 Color, half fDepth)
+{
+    OUT.Color = Color;
+
+    #if %DEPTH_FIXUP && %_RT_DEPTHFIXUP
+        OUT.Alpha.rgba = Color.aaaa;
+    #endif
+
+#ifdef %ST_FIXED_POINT
+    //Since we don't have floating point render targets and the engine doesn't support an LDR pass
+    //we do a quick tonemap to avoid burning the lighting.
+   OUT.Color.rgb = SimpleReinhardTonemap(OUT.Color.rgb);
+#endif
+
+}
+
+#define EXPOSURE_MODE_KRAWCZYK 1
+#define EXPOSURE_MODE_EV 2
+
+half ComputeExposure(int exposureMode, float2 luminanceParams, float3 adaptationParams)
+{
+    if (exposureMode == EXPOSURE_MODE_EV)
+    {
+        // Compute EV with ISO 100 and standard camera settings
+        half EV100 = log2(luminanceParams.y * LIGHT_UNIT_SCALE * 100.0 / 330.0);
+
+        // Apply automatic exposure compensation based on scene key
+        EV100 -= ((clamp(log10(luminanceParams.y * LIGHT_UNIT_SCALE + 1), 0.1, 5.2) - 3.0) / 2.0) * adaptationParams.z;
+
+        // Clamp EV
+        EV100 = clamp(EV100, adaptationParams.x, adaptationParams.y);
+
+        // Compute maximum luminance based on Saturation Based Film Sensitivity (ISO 100, lens factor q=0.65)
+        float maxLum = 1.2 * exp2(EV100) / LIGHT_UNIT_SCALE;
+
+        return 1 / maxLum;
+    }
+    else
+    {
+        // Krawczyk scene key estimation adjusted to better fit our range - low (0.05) to high key (0.8) interpolation based on avg scene luminance
+        const half sceneKey = 1.03h - 2.0h / (2.0h + log2(luminanceParams.x + 1.0));
+        return clamp(sceneKey / luminanceParams.x, adaptationParams.y, adaptationParams.z);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Depth/Fog output
+
+#include "VolumetricFog.cfi"
+
+// NOTE: float[X] was used in favor of half[X] as precision is curcial and half's is not sufficient!
+half4 EncodeSceneDepth( float depth )
+{
+    return half4(depth,depth,depth,depth);
+}
+
+// This function encodes a depth value so it can be stored in an ARGB8 rendertarget and sets a specific alpha value
+float4 EncodeSceneDepthWithAlpha( float depth, half alpha, half alphaTestRef)
+{
+    float4 ret = EncodeSceneDepth( depth );
+
+    clip(alpha - alphaTestRef);
+
+    ret.a = alpha;
+
+    return ret;
+}
+
+// This function encodes a depth value so it can be stored in an ARGB8 rendertarget and sets a specific alpha value
+float4 EncodeSceneDepthNoAlpha( float depth)
+{
+    return EncodeSceneDepth( depth );
+}
+
+// This function decodes a depth value coming from an ARGB8 rendertarget/texture
+// NOTE: 1) float[X] was used in favor of half[X] as precision is curcial and half's is not sufficient!
+//             2) smpDepth should be set up as follows...
+//
+#ifdef %ST_FIXED_POINT
+float DecodeSceneDepth( Texture2D <uint> smpDepth, float4 homogeneousPositionTexProj )
+{
+    float depthNormalized = GetLinearDepth_ProjTC( smpDepth, homogeneousPositionTexProj );
+
+    // scale back to full range
+    return depthNormalized * PerView_NearFarClipDist.y;
+}
+#else
+float DecodeSceneDepth( sampler2D smpDepth, float4 homogeneousPositionTexProj )
+{
+    float depthNormalized = GetLinearDepth_ProjTC( smpDepth, homogeneousPositionTexProj );
+
+    // scale back to full range
+    return depthNormalized * PerView_NearFarClipDist.y;
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Screen space self-shadowing approximation
+
+half ScreenSpaceSelfShadow(sampler2D smpDepth, float4x4 mViewProjection, float4 tcProj, float3 vPosWS, half3 vLight, half fSoften )
+{
+    // todo:
+    //    - jittering / try out getting away with less samples
+    //    - mask samples based on distance, should only self-shadow nearby surface
+
+    half fSign = sign(dot( vLight, PerView_ViewBasisZ ) );
+
+    float3 vLightPos = vPosWS - fSign * vLight.xyz;
+    half4 vLightProj = mul( mViewProjection, float4(vLightPos, 1) );
+    vLightProj.x = ( vLightProj.x + vLightProj.w)*0.5f / vLightProj.w;
+    vLightProj.y = (-vLightProj.y + vLightProj.w)*0.5f / vLightProj.w;
+
+    vLightProj.xy = vLightProj.xy - tcProj.xy;
+    vLightProj.xy *= fSign;
+
+    float2 lightDelta = -vLightProj * PS_ScreenSize.zw*100;
+
+    float h0 = tcProj.w;//GetLinearDepthScaled(smpDepth, tcProj).x;
+    float h = h0;
+
+    half hKernelDepthScale = (1 / h0 );
+    //lightDelta *= hKernelDepthScale;
+
+    h = min(65535, GetLinearDepthScaled(smpDepth, tcProj + 1.000 * lightDelta).x);
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.875 * lightDelta).x);
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.750 * lightDelta).x); //
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.625 * lightDelta).x);
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.500 * lightDelta).x); //
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.375 * lightDelta).x);
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.250 * lightDelta).x); //
+    h = min(h, GetLinearDepthScaled(smpDepth, tcProj + 0.125 * lightDelta).x);
+
+    half fSelfShadow = 1 - saturate((h0 - h ) * fSoften);
+    return fSelfShadow;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Common culling/interpolation functions
+
+float4 BilinearInterp(float2 UV, float4 p0, float4 p1, float4 p2, float4 p3)
+{
+    float4 bl = float4( (1.f - UV.x) * (1.f - UV.y), UV.x * (1.f - UV.y), (1.f - UV.x) * UV.y, UV.x * UV.y );
+
+    return bl.x * p0 + bl.y * p1 + bl.z * p2+ bl.w * p3;
+}
+
+float4 BarycentricInterp(float3 bcs, float4 p0, float4 p1, float4 p2)
+{
+    return bcs.x * p0 + bcs.y * p1 + bcs.z * p2;
+}
+
+float DistanceFromPlane (float3 f3Position, float4 f4PlaneEquation)
+{
+    return dot(float4( f3Position, 1.0f ), f4PlaneEquation);
+}
+
+bool ViewFrustumCull(
+                    float3 f3EdgePosition0,         // World space position of patch control point 0
+                    float3 f3EdgePosition1,         // World space position of patch control point 1
+                    float3 f3EdgePosition2,         // World space position of patch control point 2
+                    float4x4 f4ViewFrustumPlanes,   // 4 plane equations (left, right, top, bottom)
+                    float fCullEpsilon              // Epsilon to determine the distance outside the view frustum is still considered inside
+                    )
+{
+    bool4 f4PlaneTest;
+    // Left clip plane
+    f4PlaneTest.x = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[0]) < fCullEpsilon);
+    // Right clip plane
+    f4PlaneTest.y = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[1]) < fCullEpsilon);
+    // Top clip plane
+    f4PlaneTest.z = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[2]) < fCullEpsilon);
+    // Bottom clip plane
+    f4PlaneTest.w = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[3]) < fCullEpsilon);
+
+    // Triangle has to pass all 4 plane tests to be visible
+    return !all( f4PlaneTest );
+}
+
+bool ViewFrustumCull(
+                    float3 f3EdgePosition0,         // World space position of patch control point 0
+                    float3 f3EdgePosition1,         // World space position of patch control point 1
+                    float3 f3EdgePosition2,         // World space position of patch control point 2
+                    float3 f3EdgePosition3,         // World space position of patch control point 3
+                    float4x4 f4ViewFrustumPlanes,   // 4 plane equations (left, right, top, bottom)
+                    float fCullEpsilon              // Epsilon to determine the distance outside the view frustum is still considered inside
+                    )
+{
+    bool4 f4PlaneTest;
+    // Left clip plane
+    f4PlaneTest.x = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[0]) < fCullEpsilon);
+    // Right clip plane
+    f4PlaneTest.y = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[1]) < fCullEpsilon);
+    // Top clip plane
+    f4PlaneTest.z = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[2]) < fCullEpsilon);
+    // Bottom clip plane
+    f4PlaneTest.w = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+        || (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[3]) < fCullEpsilon);
+
+    // Quad has to pass all 4 plane tests to be visible
+    return !all( f4PlaneTest );
+}
+
+//==============================================================================
+// Toon Shading and Silhouette related functions
+//==============================================================================
+float3 calculateToonColor(float3 inputColor)
+{
+    const float     toonLevels[] = { 0, 0.2, 0.3, 0.7, 1.0 };   // EXPOSE & REPLACE with a toon LUT
+    const float3    luminanceCoeffs = float3(0.299, 0.587, 0.114);
+
+    float   pixDiffLum = max(dot(luminanceCoeffs, inputColor), 0.00001);
+    int     lumDiffIdx = int(min(pixDiffLum * 5.0, 4.999));
+    float   lumDiffBlend = saturate(1.0 - (pixDiffLum * 4.999 - lumDiffIdx));
+    int     lumDiffIdxP1 = min(lumDiffIdx + 1, 4);
+
+    float3  pixToonColor = inputColor * lerp( toonLevels[lumDiffIdxP1], toonLevels[lumDiffIdx], pow(smoothstep(0, 1, lumDiffBlend), 8)) / pixDiffLum;
+
+    return pixToonColor;
+}
+
+//------------------------------------------------------------------------------
+float CalculateFeatureSilhouettes(
+    Texture2D<float4> NormalRT,
+    float relDepth, float2 pixelCoord, float3 viewVec, float3 surfNormal)
+{
+    // Radius of normals sampling - controls width and disparity of the features.
+    half2 	sampleRadiusUV = half2(0.95, 0.95);	    // EXPOSE as user settings
+    half3 	normalNeighbors[4];
+
+    // Order of samples (y might be upside down - does not matter)
+    //  3  0
+    //  1  2
+    normalNeighbors[0] = normalize((NormalRT[pixelCoord + sampleRadiusUV].xyz * 2.0 - 1.0));
+    normalNeighbors[1] = normalize((NormalRT[pixelCoord - sampleRadiusUV].xyz * 2.0 - 1.0));
+    sampleRadiusUV.y = -sampleRadiusUV.y;
+    normalNeighbors[2] = normalize((NormalRT[pixelCoord + sampleRadiusUV].xyz * 2.0 - 1.0));
+    normalNeighbors[3] = normalize((NormalRT[pixelCoord - sampleRadiusUV].xyz * 2.0 - 1.0));
+
+    // Applying different filters - vertical, horizontal, diagonal
+    float   total = 0;
+    total += (1.0 - saturate(dot(normalNeighbors[0], normalNeighbors[1])));
+    total += (1.0 - saturate(dot(normalNeighbors[2], normalNeighbors[3])));
+    total += (1.0 - saturate(dot(normalNeighbors[0], normalNeighbors[2])));
+    total += (1.0 - saturate(dot(normalNeighbors[1], normalNeighbors[3])));
+    total += (1.0 - saturate(dot(normalNeighbors[1], normalNeighbors[2])));
+    total += (1.0 - saturate(dot(normalNeighbors[0], normalNeighbors[3])));
+
+    // Reduce the features effect as we get further away
+    const float    surfaceBendStrength = 0.9;  // EXPOSE as user settings
+    total *= surfaceBendStrength * sqrt(1.0 - relDepth);
+
+    // Depth difference TH - controls sensitivity to features.  high [0.05 .. 0.7] low 
+    float    silhouetteNormalCosTH = 0.25;		// EXPOSE as user settings
+    total = 1.0 - step(total, silhouetteNormalCosTH);
+
+    return total;
+}
+
+//------------------------------------------------------------------------------
+float CalculateOutlineAndFeatureSilhouettes(
+    Texture2D<float4> DepthRT,
+    Texture2D<float4> NormalRT,
+    float linearZ, float2 pixelCoord, float3 viewVec, float3 surfNormal)
+{
+    // Radius of depth sampling - controls width and disparity of the silhouette lines.
+    half2 	sampleRadiusUV = half2(1.05, 1.05);	    // EXPOSE as user settings
+    float4  linearZNeighbors = float4(0, 0, 0, 0);
+
+    // Order of samples (y might be upside down - does not matter)
+    //  w  x
+    //  y  z
+    linearZNeighbors.x = DepthRT[pixelCoord + sampleRadiusUV].r - linearZ;
+    linearZNeighbors.y = DepthRT[pixelCoord - sampleRadiusUV].r - linearZ;
+    sampleRadiusUV.y = -sampleRadiusUV.y;
+    linearZNeighbors.z = DepthRT[pixelCoord + sampleRadiusUV].r - linearZ;
+    linearZNeighbors.w = DepthRT[pixelCoord - sampleRadiusUV].r - linearZ;
+
+    // Applying different filters - vertical, horizontal, diagonal
+    float   depthSilhouette = 0;
+
+    float4    filterMults[3] = {
+        float4(1.0, 1.0, 1.0, 1.0), // points
+        float4(1.0, 1.0, .0, .0),   // diagonal lines
+        float4(0.0, 0.0, 1.0,1.0),  // diagonal lines
+    };
+
+    // Summing the differences - the scale controls the snesitivity
+    depthSilhouette += abs(dot(filterMults[0], linearZNeighbors));
+    depthSilhouette += abs(dot(filterMults[1], linearZNeighbors));
+    depthSilhouette += abs(dot(filterMults[2], linearZNeighbors));
+
+    // Reduce sensitivity with distance / removes hard lines as we get further unless high difference
+    const half     distanceScale = 50.0;    // expose this to the user
+    // Remove sensitivity of distance change due to shalow slope (avoid 'black' polygons near horizon)
+    half            viewAngleTH = dot(viewVec, surfNormal);
+    // Reduce sensitivity to depth difference as we get further away
+    half            relDepth = linearZ / PerView_NearFarClipDist.b;
+    depthSilhouette *= distanceScale * (1.0 - relDepth * relDepth) * viewAngleTH;
+
+    // Setting depth difference TH
+    float 	silhouetteDepthTH = 0.04;	// EXPOSE as user settings
+    depthSilhouette = 1.0 - step(depthSilhouette, silhouetteDepthTH);
+
+    // Summing the differences
+    float   normalSilhouette = CalculateFeatureSilhouettes(NormalRT, relDepth, pixelCoord, viewVec, surfNormal);
+    float   silhouette = 1.0 - saturate(normalSilhouette + depthSilhouette);
+
+    return silhouette;
+}
+//==============================================================================

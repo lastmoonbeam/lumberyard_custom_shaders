@@ -1,0 +1,95 @@
+//--------------------------------------------------------------------------------------------
+//
+// This product contains one or more programs protected under international and 
+// U.S. copyright laws as unpublished works.  They are confidential and proprietary to Dolby Laboratories.  
+// Their reproduction or disclosure, in whole or in part, or the production of derivative works 
+// therefrom without the express permission of Dolby Laboratories is prohibited.  
+// Copyright 2013-2015 by Dolby Laboratories.  All rights reserved.
+//
+//--------------------------------------------------------------------------------------------
+ 
+float4 Parameters0;
+float4 Parameters1;
+
+// Helper defines
+#define LeftTopX ((int)Parameters0.x)
+#define LeftTopY ((int)Parameters0.y)
+#define Width ((int)Parameters0.z)
+#define Height ((int)Parameters0.w)
+#define OutWidth ((int)Parameters1.x)
+ 
+// - Settings
+// Reduction passes
+#define NUM_REDUCTION_X 16
+#define NUM_REDUCTION_Y 16
+
+// Number of threads
+#define NUM_THREADS_X 16
+#define NUM_THREADS_Y 16
+
+// Strided reads for partial convergence
+#define NUM_STRIDE_X 2
+#define NUM_STRIDE_Y 2
+
+struct OutputData
+{
+	float TotalMin;
+	float TotalMax;
+	float TotalAvg;
+};
+
+RWStructuredBuffer<float4> OutputReduction : register(u0);
+Texture2D<float4> Texture: register(t0);
+
+[numthreads(NUM_THREADS_X, NUM_THREADS_Y, 1)]									
+void CS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,		
+    uint3 GroupThreadId : SV_GroupThreadID,				
+	uint GroupIndex: SV_GroupIndex) 					
+{
+	float3 VMin = float3(10000000.0, 10000000.0, 10000000.0);
+	float3 VMax = float3(-10000000.0, -10000000.0, -10000000.0);
+	float3 VAvgAccum = float3(0.0, 0.0, 0.0);
+	
+	int LtInX = LeftTopX + DispatchThreadId.x * NUM_REDUCTION_X;
+	int LtInY = LeftTopY + DispatchThreadId.y * NUM_REDUCTION_Y;
+	
+	int cx, cy;
+	float4 color;
+	[unroll] for(int y=0; y<NUM_REDUCTION_X; y++)
+	{
+		cy=(LtInY+y)*NUM_STRIDE_Y;
+		if(cy >= Height)
+			continue;
+		[unroll] for(int x=0; x<NUM_REDUCTION_X; x++)
+		{
+			cx=(LtInX+x)*NUM_STRIDE_X;	
+			if(cx >= Width)
+				continue;
+			
+			color = Texture.Load(int3(cx, cy,0));
+			VMin = min(VMin, color.xyz);
+			VMax = max(VMax, color.xyz);
+			VAvgAccum += color.xyz;
+		}
+	}
+
+	OutputData vout;
+	vout.TotalMin = min(min(VMin.x, VMin.y), VMin.z);
+	vout.TotalMax = max(max(VMax.x, VMax.y), VMax.z);
+	vout.TotalAvg = (VAvgAccum.x + VAvgAccum.y + VAvgAccum.z) / (NUM_REDUCTION_X * NUM_REDUCTION_Y * 3);
+	
+	uint id=DispatchThreadId.x + DispatchThreadId.y * OutWidth;
+	float4 value=float4( vout.TotalMin, vout.TotalMax, vout.TotalAvg, 0.0);
+	OutputReduction[id] = value;
+}
+
+// Default technique
+technique Default
+{
+  pass p0
+  {
+    ComputeShader = CS();
+  }
+}

@@ -1,0 +1,65 @@
+#include "GPUParticle.cfi"
+#include "GPUParticleHelpers.cfi"
+
+#define NUM_TRHEADS_X 1024
+#define SORT_SIZE_MULTIPLY 2
+#define SORT_SIZE (NUM_TRHEADS_X * SORT_SIZE_MULTIPLY)
+
+float4 Parameters;                                              // j, k, maxParticles, bufferOffset
+RWStructuredBuffer < uint2 > ParticleSortIndices: register(u0);   // per-particle data
+
+groupshared uint2 g_arrayToSort[SORT_SIZE];
+
+void swap(inout uint2 x, inout uint2 y)
+{
+    uint2 temp = x;
+    x = y;
+    y = temp;
+}
+
+[numthreads(NUM_TRHEADS_X, 1, 1)]
+void CS(
+    uint3 GroupId : SV_GroupID,
+    uint3 DispatchThreadId : SV_DispatchThreadID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+    uint GroupIndex: SV_GroupIndex)
+{
+    uint globalIndex = DispatchThreadId.x;
+    int bufferOffset = asint(Parameters.w);
+
+    g_arrayToSort[GroupIndex] = ParticleSortIndices[GroupId.x * SORT_SIZE + GroupIndex + bufferOffset];
+    g_arrayToSort[GroupIndex + NUM_TRHEADS_X] = ParticleSortIndices[GroupId.x * SORT_SIZE + GroupIndex + NUM_TRHEADS_X + bufferOffset];
+
+    AllMemoryBarrierWithGroupSync();
+
+    for (uint k = 2; k <= SORT_SIZE; k *= 2)
+    {
+        for (uint j = k / 2; j > 0; j /= 2)
+        {
+            uint i = GroupIndex + (GroupIndex & (~(j - 1)));
+            uint dir = globalIndex + (globalIndex & (~(j - 1)));
+
+            uint directionMin = j * clamp(dir & k, 0, 1);
+            uint directionPlus = j * (1 - clamp(dir & k, 0, 1));
+
+            [branch]
+            if (g_arrayToSort[i + directionMin].y > g_arrayToSort[i + directionPlus].y)
+            {
+                swap(g_arrayToSort[i + directionMin], g_arrayToSort[i + directionPlus]);
+            }
+            AllMemoryBarrierWithGroupSync();
+        }
+    }
+
+    ParticleSortIndices[GroupId.x * SORT_SIZE + GroupIndex + bufferOffset] = g_arrayToSort[GroupIndex];
+    ParticleSortIndices[GroupId.x * SORT_SIZE + GroupIndex + NUM_TRHEADS_X + bufferOffset] = g_arrayToSort[GroupIndex + NUM_TRHEADS_X];
+}
+
+// Default technique
+technique Default
+{
+    pass p0
+    {
+        ComputeShader = CS();
+    }
+}

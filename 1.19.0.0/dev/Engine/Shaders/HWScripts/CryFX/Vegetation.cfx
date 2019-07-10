@@ -1,0 +1,867 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "VegetationValidations.cfi"
+
+#define INST_STREAM_CUSTOM                     \
+    #if %_RT_INSTANCING_ATTR                   \
+    float4 InstAmbientObjectCol: TEXCOORDN;    \
+    #if %_RT_FOG                               \
+    float4 InstAvgFogVolumeContrib: TEXCOORDN; \
+    #endif                                     \
+    #endif                                     \
+
+float Script: STANDARDSGLOBAL
+<
+string Script =
+    "Public;"
+    "SupportsAttrInstancing;"
+    "ShaderDrawType = Light;"
+    "ShaderType = Vegetation;"
+#if %VERTCOLORS
+    "VertexColors"
+#endif
+#if %DETAIL_BENDING
+  #if %GRASS
+    "VT_DetailBendingGrass;"
+  #elif %LEAVES
+    "VT_DetailBending;"
+  #endif
+#endif
+#if ENABLE_TESSELLATION
+    "HWTessellation;"
+#endif
+    "SupportsDeferredShading;"
+    "SupportsFullDeferredShading;"
+    "NoChunkMerging;"
+    "Cull = NONE;";
+>;
+
+// Un-Tweakables /////////////////
+
+float4 BaseTCMatrix: PB_TerrainBaseMatrix;
+
+float4 BlendTerrainColInfo: PB_BlendTerrainColInfo;
+
+///////////////// Samplers //////////////////
+OPACITYMAP
+
+sampler2D fromObjSampler0 = sampler_state
+{
+    Texture = $FromObj;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = LINEAR;
+    AddressU = Clamp;
+    AddressV = Clamp;
+    sRGBLookup = true;
+};
+
+#if %BLENDLAYER
+sampler2D DiffuseMap2Sampler
+{
+    string UIName = "Second Diffuse Map";
+    string UIDescription = "Base surface color for blend layer";
+    Texture = $CustomMap;
+    sRGBLookup = true;
+};
+
+sampler2D SpecularMap2Sampler
+{
+    string UIName = "Second Specular Map";
+    string UIDescription = "Reflective and shininess intensity and color of reflective highlights for blend layer";
+    Texture = $Specular2;
+    sRGBLookup = false;
+};
+
+sampler2D BumpMap2Sampler
+{
+    string UIName = "Second Normal Map";
+    string UIDescription = "Normal direction for each pixel simulating bumps on the surface for blend layer. Smoothness map contained in alpha channel";
+    Texture = $CustomSecondaryMap;
+    sRGBLookup = false;
+};
+
+sampler2D HeightMap2Sampler
+{
+    string UIName = "Second Height Map";
+    string UIDescription = "Height for offset bump, POM, silhouette POM, and displacement mapping defined by a Grayscale texture for blend layer";
+    Texture = $Subsurface;
+    sRGBLookup = false;
+};
+
+sampler2D BlendMapSampler
+{
+    string UIName = "Blend Map";
+    string UIDescription = "Alpha mask for blend layer";
+    Texture = $Opacity;
+    sRGBLookup = false;
+};
+
+sampler2D smoothnessMap2Sampler
+{
+    string UIName = "Second Gloss Map";
+    string UIDescription = "Gloss Map for the second blend layer";
+    Texture = $DecalOverlay;
+    sRGBLookup = false;
+};
+#endif // %BLENDLAYER
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Tweakables //////////////////////
+
+#if %LEAVES
+half CapOpacityFalloff
+<
+register = PER_MATERIAL_1.x;
+string UIWidget = "slider";
+string UIHelp = "Caps parallel view opacity fall off";
+string UIName = "Cap opacity fall off";
+float UIMin = 0.0;
+float UIMax = 1.0;
+float UIStep = 0.001;
+> = 1.0;
+#endif // %LEAVES
+
+#if %LEAVES  || %GRASS
+half4 TransmittanceColor
+<
+register = PER_MATERIAL_0;
+string UIHelp = "Color tint for translucency";
+string UIName = "Transmittance Color";
+string UIWidget = "color";
+> = {1.0, 1.0, 0.6, 1.0};
+
+float NormalViewDependency
+<
+register = PER_MATERIAL_1.y;
+string UIHelp = "Orients normal towards viewer (useful for planes)";
+string UIName = "Normal View Dependency";
+string UIWidget = "slider";
+float UIMin = 0;
+float UIMax = 0.95;
+float UIStep = 0.05;
+> = 0.5;
+
+float BackDiffuseMultiplier
+<
+register = PER_MATERIAL_1.z;
+string UIHelp = "Adjusts translucency intensity";
+string UIName = "Transmittance Multiplier";
+string UIWidget = "slider";
+float UIMin = 0;
+float UIMax = 4.0;
+float UIStep = 0.05;
+> = 1.0;
+#endif //  %LEAVES  || %GRASS
+
+float BlendTerrainCol
+<
+register = PER_MATERIAL_1.w;
+string UIHelp = "Sets balance between terrain and vegetation color";
+string UIName = "Terrain Color Blend";
+string UIWidget = "slider";
+float UIMin = 0.0;
+float UIMax = 1.0;
+float UIStep = 0.05;
+> = 0.0;
+
+float BlendTerrainColDist
+<
+register = PER_MATERIAL_2.x;
+string UIHelp = "Sets balance between terrain and vegetation color";
+string UIName = "Terrain Color Blend Dist";
+string UIWidget = "slider";
+float UIMin = 0.01;
+float UIMax = 1.0;
+float UIStep = 0.05;
+> = 0.5;
+
+#if %DETAIL_MAPPING
+half DetailBumpScale
+<
+register = PER_MATERIAL_2.y;
+string UIHelp = "Set detail bump scale";
+string UIName = "Detail bump scale";
+string UIWidget = "slider";
+float UIMin = 0.0;
+float UIMax = 10.0;
+float UIStep = 0.1;
+> = 0.5;
+
+half DetailDiffuseScale
+<
+register = PER_MATERIAL_2.z;
+string UIHelp = "Set diffuse detail blend scale";
+string UIName = "Detail diffuse scale";
+string UIWidget = "slider";
+float UIMin = 0.0;
+float UIMax = 1.0;
+float UIStep = 0.1;
+> = 0.5;
+
+half DetailGlossScale
+<
+register = PER_MATERIAL_2.w;
+string UIHelp = "Set gloss detail blend scale";
+string UIName = "Detail gloss scale";
+string UIWidget = "slider";
+float UIMin = 0.0;
+float UIMax = 1.0;
+float UIStep = 0.1;
+> = 0.5;
+#endif // %DETAIL_MAPPING
+
+#if %BLENDLAYER
+    half BlendFactor
+    <
+        register = PER_MATERIAL_5.x;
+        string UIHelp = "Change visbility of blended layer";
+        string UIName = "Blend Factor";
+        string UIWidget = "slider";
+        float UIMin = 0.0;
+        float UIMax = 16.0;
+        float UIStep = 0.2;
+    > = 8.0;
+
+    half BlendLayer2Tiling
+    <
+        register = PER_MATERIAL_5.y;
+        string UIHelp = "Change tiling of 2nd blend layer";
+        string UIName = "Blend Layer 2 Tiling";
+        string UIWidget = "slider";
+        float UIMin = 0.0;
+        float UIMax = 20.0;
+        float UIStep = 0.005;
+    > = 1.0;
+
+    half BlendFalloff
+    <
+        register = PER_MATERIAL_5.z;
+        string UIHelp = "Change falloff of blending";
+        string UIName = "Blend Falloff";
+        string UIWidget = "slider";
+        float UIMin = 0.1;
+        float UIMax = 128.0;
+        float UIStep = 1.0;
+    > = 32.0;
+
+    half BlendMaskTiling
+    <
+        register = PER_MATERIAL_4.x;
+        string UIHelp = "Change tiling of blend mask";
+        string UIName = "Blend Mask Tiling";
+        string UIWidget = "slider";
+        float UIMin = 0.05;
+        float UIMax = 20.0;
+        float UIStep = 0.05;
+    > = 1.0;
+
+    half4 BlendLayer2Diffuse
+    <
+        register = PER_MATERIAL_7;
+        string UIHelp = "Controls Diffuse (Tint) of 2nd blend layer";
+        string UIName = "Blend Layer 2 - Diffuse (Tint)";
+        string UIWidget = "color";
+    > = { 1.0, 1.0, 1.0, 1.0 };
+
+    half4 BlendLayer2Specular
+    <
+        register = PER_MATERIAL_6
+        string UIHelp = "Controls Specular of 2nd blend layer";
+        string UIName = "Blend Layer 2 - Specular";
+        string UIWidget = "color";
+    > = { 0.2314, 0.2314, 0.2314, 0.0 };
+
+    half BlendLayer2Smoothness
+    <
+        register = PER_MATERIAL_5.w;
+        string UIHelp = "Controls Smoothness of 2nd blend layer";
+        string UIName = "Blend Layer 2 - Smoothness";
+        string UIWidget = "slider";
+        float UIMin = 0.0;
+        float UIMax = 255.0;
+        float UIStep = 0.5;
+    > = 10.0;
+#endif // %BLENDLAYER
+
+#include "VertexLib.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// Custom shading pass structure /////////////////////////////////////
+
+struct fragPassCustom
+{
+    half4 cBackDiffuseMap;
+
+    half4 cBackLight;
+    half4 cFrontLight;
+
+    half3 cBackDiffCoef;
+
+    half3 cFilterColor;
+    half fOcclShadowAcc;
+
+    half3 cShadingFront;
+    half3 cShadingBack;
+
+    half4 cColor0;
+
+    half fRenderQuality;
+    half fImpostorAtten;
+    half fAmbientContribution;
+};
+
+struct fragLightPassCustom
+{
+};
+
+#include "ShadeLib.cfi"
+
+////////////////////////////////////////////////////////
+//                GENERAL PASS
+////////////////////////////////////////////////////////
+
+// Comment out of structure to avoid anoying assertions
+
+// baseTC.wz: blend with terrain color uvs
+// backLight.w: blend with terrain color object brightness
+// binormVec.w: alpha test value (with parallel view opacity falloff)
+// Pos.w: used for fog
+// screenProj.z: blend with terrain color blend amount
+
+///////////////// vertex input/output //////////////////
+
+struct vtxOutVegetation
+{
+#if %_DS || %_PS || !ENABLE_TESSELLATION || %_RT_NO_TESSELLATION
+    OUT_P
+#endif
+    float4 baseTC: TEXCOORDN;
+#if %DETAIL_MAPPING
+    float4 detailTC : TEXCOORDN;
+#endif
+    float4 screenProj: TEXCOORDN;
+
+    float4 Pos : TEXCOORDN;
+    #if !%GRASS
+        #if %_RT_FOG
+            float4 tangVec: TEXCOORDN;
+            float4 binormVec: TEXCOORDN;
+        #endif
+    #endif
+
+  #if %LEAVES || %GRASS || %_RT_BLEND_WITH_TERRAIN_COLOR
+    float4 backLight: TEXCOORDN;
+  #endif
+
+  #if %GRASS
+    float4 frontLight: TEXCOORDN;
+  #endif
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+    float4 vView: TEXCOORDN;
+    half4 vNormal: TEXCOORDN;
+#endif
+
+    float4 Color0: COLOR0;
+
+    // Cant allow volumetric fog on lower specs.. no more interpolators left
+#if %_RT_FOG
+  #if !%_RT_QUALITY && !%_RT_QUALITY1
+    float4 AvgFogVolumeContrib: COLOR1;
+  #else
+    float4 AvgFogVolumeContrib: TEXCOORDN;
+  #endif
+#endif
+};
+
+///////////////// vertex shaders //////////////////
+vtxOutVegetation VegetationVS(app2vertGeneral IN)
+{
+    vtxOutVegetation OUT = (vtxOutVegetation)0;
+
+    streamPos vertPassPos = (streamPos)0;
+    streamPos_FromGeneral(IN, vertPassPos);
+
+#if !ENABLE_TESSELLATION || %_RT_NO_TESSELLATION
+    OUT.HPosition = Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos);
+    OUT.screenProj = HPosToScreenTC(OUT.HPosition);
+#else
+    OUT.screenProj = HPosToScreenTC(Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos));
+#endif
+
+    // Apply texture modifiers
+    _ModifyUV_1(vertPassPos.baseTC, OUT.baseTC, vertPassPos.Position );
+
+#if %DETAIL_MAPPING
+    #if %DETAIL_MAPPING_UV_SET_2
+        OUT.detailTC = _ModifyDetailUV(vertPassPos.baseTC2, vertPassPos.Position);
+    #else
+        OUT.detailTC = _ModifyDetailUV(vertPassPos.baseTC, vertPassPos.Position);
+    #endif
+#endif
+
+    // This is incorrect since we need to compensate for non-uniform scale, however cost is possibly not justified
+    // for vegetations which have minimal scale distortion.
+    float3 worldTangentS = normalize(mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]));
+    float3 worldTangentT = normalize(mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]));
+    float3 worldTangentN = normalize(mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2]));
+
+    //world space pos and view vec
+    float3 view = vertPassPos.WorldPos.xyz - PerView_WorldViewPos.xyz;
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+    OUT.vNormal.xyz = normalize(mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.Normal.xyz));
+    OUT.vView.xyz = view.xyz;
+#endif
+
+#if !%GRASS
+    #if %_RT_FOG
+        // Output tangents only for cases that require it - alpha blending, recursive passes
+        OUT.tangVec = float4(worldTangentS.xyz, vertPassPos.Tangent.w);
+        OUT.binormVec.xyz = worldTangentT;
+    #endif
+#endif
+    OUT.Pos.xyz = view;
+
+    float3 viewVector = normalize(-view.xyz);
+    float eyeTangentDot = dot(viewVector, worldTangentN);
+
+    half3 envAmbientCol = 1;
+    half aveVis = 1; //average visibility for object (0th coeff)
+    float4 AmbObjectCol;
+  #if %_RT_INSTANCING_ATTR
+    #fetchinst (AmbObjectCol = IN.InstAmbientObjectCol, vertPassPos.nInstance);
+  #else
+    AmbObjectCol = AmbientObjectCol;
+  #endif
+
+    float fRendQuality = AmbObjectCol.w;
+    float fFlipNormal = min(eyeTangentDot + 0.1f, 1.f); //using sign gives us better visual result bug we get nasty popup
+  #if %LEAVES || %GRASS
+    worldTangentN *= fFlipNormal;
+  #endif
+    #if !%GRASS
+        #if %_RT_FOG
+            OUT.tangVec.w *= fFlipNormal;
+        #endif
+    #endif
+
+    // Grass shading all done per-vertex
+    #if %GRASS
+        OUT.frontLight.xyz = saturate(dot(PerFrame_SunDirection.xyz, worldTangentN));
+    #endif
+
+    OUT.Color0 = 1;
+    OUT.Color0.x = fRendQuality;
+    OUT.Color0.y = AmbObjectCol.y;  //alpha blend term
+    OUT.Color0.z = worldTangentN.z*0.25+0.75; // output world space vertex normal z component, for grass
+
+    // optimization: ambient multiplier * ambient occlusion
+    float fAlpha = vertPassPos.Color.w;
+#if %BLENDLAYER
+    // blend layer vtx alpha overlaps with alpha on vegetation. Use blue channel instead
+    fAlpha = vertPassPos.Color.z;
+    OUT.Color0.z = vertPassPos.Color.w;
+#endif
+
+#if !%_RT_BLEND_WITH_TERRAIN_COLOR
+    #if !%_RT_FOG
+    fAlpha *= AmbObjectCol.x;
+    #endif
+#endif
+
+    OUT.Color0.w = fAlpha;
+
+  #if %LEAVES || %GRASS
+
+    half3 cBackDiffuseMtl = BackDiffuseMultiplier * fRendQuality;     // attenuate back lighting
+
+        #if %LEAVES
+    OUT.backLight.xyz = cBackDiffuseMtl;         // only store instance + mtl
+        #else
+    OUT.backLight.xyz *= cBackDiffuseMtl;
+        #endif
+
+  #endif
+
+  #if %_RT_BLEND_WITH_TERRAIN_COLOR
+    OUT.backLight.w = AmbObjectCol.x; // still used?
+    float fCameraDistance = length(view);
+    float fBlendFactor =  saturate(BlendTerrainCol + (fCameraDistance/ (BlendTerrainColInfo.w-BlendTerrainColInfo.w*BlendTerrainColDist)));
+    OUT.screenProj.z =  fBlendFactor*fBlendFactor;
+    OUT.baseTC.zw = float2(BlendTerrainColInfo.zz*vertPassPos.WorldPos.yx+BlendTerrainColInfo.xy);                                          // terrain color uvs
+  #endif
+
+#if %_RT_FOG
+    float fVolumetricFogDensity = GetVolumetricFogDensity(vertPassPos.WorldPos.xyz);
+    OUT.Pos.w = fVolumetricFogDensity;
+
+   #if %_RT_INSTANCING_ATTR
+    {
+     #fetchinst (OUT.AvgFogVolumeContrib = IN.InstAvgFogVolumeContrib, vertPassPos.nInstance);
+    }
+   #else
+    OUT.AvgFogVolumeContrib = AvgFogVolumeContrib[0];
+  #endif
+
+  #if !%_RT_ALPHABLEND
+    // additive blending case
+    OUT.AvgFogVolumeContrib.w *= fVolumetricFogDensity;
+    OUT.AvgFogVolumeContrib.xyz = 0.0;
+  #endif
+
+    // pass through parallel view opacity falloff
+    #if !%GRASS && %LEAVES
+    float alphaTest = GetMaterial_AlphaTest();
+    OUT.binormVec.w = ParallelOpacityFalloff(vertPassPos.WorldPos.xyz, worldTangentN.xyz, CapOpacityFalloff, alphaTest);
+    #endif
+
+    // Workaround for sprites generation (skip fog)
+    #if %_RT_NOZPASS
+        OUT.AvgFogVolumeContrib = float4(0, 0, 0, 1);
+        OUT.Pos.w = 1;
+    #endif
+#endif
+
+    return OUT;
+}
+
+///////////////// pixel shaders //////////////////
+
+void frag_unify_parameters(inout fragPass pPass)
+{
+    pPass.bCustomComposition = true;
+#if !%GRASS
+    pPass.bRenormalizeNormal = true;
+    pPass.bDeferredSpecularShading = true;
+#endif
+
+    pPass.pCustom.fRenderQuality = pPass.pCustom.cColor0.x;
+
+#if %DETAIL_MAPPING
+    pPass.bDetailBumpMapping = true;
+    pPass.vDetailBumpTiling = half2(PerMaterial_DetailTiling.xy);
+    pPass.fDetailBumpScale = DetailBumpScale;
+    pPass.vDetailBlendAmount = half2(DetailDiffuseScale, DetailGlossScale);
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_vegetation_unify(inout fragPass pPass, in vtxOutVegetation IN)
+{
+    // Set quality level (LOW, MEDIUM, HIGH or MAX)
+    pPass.nQuality = GetShaderQuality();
+
+    pPass.IN.baseTC = IN.baseTC;
+    pPass.IN.bumpTC = pPass.IN.baseTC;
+
+#if !%GRASS
+
+    pPass.IN.vTangent = half4(1, 0, 0, 1);
+    pPass.IN.vBinormal = half4(0, 1, 0, 1);
+    pPass.IN.vNormal.xyz = half4(0, 0, 1, 1);
+
+  #if %_RT_FOG
+    pPass.IN.vTangent = IN.tangVec;
+    pPass.IN.vBinormal = IN.binormVec;
+    pPass.IN.vNormal.xyz = (cross(pPass.IN.vTangent.xyz, pPass.IN.vBinormal.xyz)) * pPass.IN.vTangent.w;  // 4 alu
+  #endif
+
+#endif
+    pPass.IN.vView = IN.Pos;
+
+    pPass.IN.screenProj = IN.screenProj;
+    pPass.IN.Color = pPass.pCustom.cColor0 = IN.Color0;
+
+    // Vegetation has custom color ouput - match blend layer GetLayerBlendingValue color inputs
+    pPass.IN.Color.zw = pPass.IN.Color.wz;
+
+#if %BLENDLAYER
+    float4  blendMapTC = IN.baseTC;      // no support for second UV set yet
+    pPass.IN.blendMapTC = blendMapTC.xy;
+
+    // The 2nd diffuse map, 2nd height map, etc. use a modified texture coordinate
+    float4  modifiedBlendLayerTC = _ModifyBlendLayerUV(blendMapTC, IN.Pos );
+    pPass.IN.blendLayerTC = modifiedBlendLayerTC.xy;
+#endif
+
+#if %LEAVES || %GRASS || %_RT_BLEND_WITH_TERRAIN_COLOR
+    pPass.pCustom.cBackLight = IN.backLight;
+#endif
+
+#if %GRASS
+    pPass.pCustom.cFrontLight = IN.frontLight * half4(PerFrame_SunColor.xyz, 1);
+#endif
+
+#if %_RT_FOG
+    pPass.IN.AvgFogVolumeContrib = IN.AvgFogVolumeContrib;
+#endif
+
+    frag_unify_parameters(pPass);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_begin(inout fragPass pPass)
+{
+    float4 baseTC = pPass.IN.baseTC;
+
+    // Vegetation has custom color ouput - override vtx color back to default
+    pPass.IN.Color = 1;
+
+    pPass.fNdotE = (dot(pPass.vView.xyz, pPass.vNormal.xyz));
+
+    // set alpha and apply smooth transition when using alpha blending
+    pPass.fAlpha = pPass.cDiffuseMap.w * pPass.pCustom.cColor0.y;
+
+    // Initialize values..
+    pPass.pCustom.cFilterColor = 1.0;
+    pPass.pCustom.cBackDiffuseMap = 1.0;
+    pPass.cSpecularMap = 1.0;
+
+  #if %LEAVES || %GRASS
+      #if  %LEAVES
+    pPass.pCustom.cBackDiffuseMap = GetTexture2D(opacityMapSampler, pPass.IN.baseTC.xy).r;
+      #endif
+
+    // Set back shading
+    pPass.pCustom.cShadingBack = pPass.pCustom.cBackLight.xyz * pPass.pCustom.cBackDiffuseMap;
+#endif
+
+  #if !%GRASS
+    pPass.cSpecularMap = GetTexture2D(specularMapSampler, pPass.IN.baseTC.xy);
+  #endif
+
+    pPass.cDiffuseMap.xyz *= PerMaterial_DiffuseColor.xyz;
+    pPass.cSpecularMap.xyz *= PerMaterial_SpecularColor.xyz;
+
+    //-----------------------------------------------
+    // Second Blend Layer - used by the Forward Tiled
+    //-----------------------------------------------
+#if %BLENDLAYER
+    half4 diffuseMap2 = GetTexture2D(DiffuseMap2Sampler, pPass.IN.blendLayerTC.xy);
+    half4 specularMap2 = GetTexture2D(SpecularMap2Sampler, pPass.IN.blendLayerTC.xy);
+    half glossLayer2 = GetTexture2D(smoothnessMap2Sampler, pPass.IN.blendLayerTC.xy).r;
+
+    // Diffuse blend layer calculation
+    diffuseMap2.rgb *= BlendLayer2Diffuse.rgb;     // Second layer albedo/tint color is blended separately
+    pPass.cDiffuseMap = lerp(pPass.cDiffuseMap, diffuseMap2, pPass.blendFac);
+
+    // Specular blend layer calculation
+    specularMap2.rgb *= BlendLayer2Specular.rgb;    // Second layer specular is blended separately
+    pPass.cSpecularMap.rgb = lerp(pPass.cSpecularMap.rgb, specularMap2, pPass.blendFac);
+
+    // Gloss blend layer calculation
+    const half      normalizeFactor = 1.0h / 256.0h;
+    glossLayer2 *= (BlendLayer2Smoothness * normalizeFactor);    // multiplying with layer 2 smoothness
+    pPass.fGloss = lerp(pPass.fGloss, glossLayer2, pPass.blendFac);
+#endif // %BLENDLAYER
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_per_light(inout fragPass pPass, inout fragLightPass pLight)
+{
+    pPass.pCustom.fOcclShadowAcc += pLight.fOcclShadow;
+    pPass.pCustom.cFilterColor = pLight.cFilter;
+
+#if !%GRASS
+
+    // Front shading terms
+    half3 cDiffuse = 0;
+    half3 cSpecular = 0;
+
+    LeafShadingFront(pPass.vView, pLight.vLight, pPass.vNormal.xyz,
+        pLight.cDiffuse.xyz, pLight.cSpecular.xyz,
+        cDiffuse, cSpecular,
+        pPass.fGloss);
+
+    half3 cK = pLight.fOcclShadow * pLight.fFallOff * pLight.cFilter;
+    pPass.cDiffuseAcc += cDiffuse * cK;                                                             // 1 alu
+
+    #if %LEAVES
+    half fTransmitance = saturate(dot(-pPass.vNormal.xyz, pLight.vLight.xyz)*0.6+0.4);
+    pPass.cBackDiffuseAcc += fTransmitance * pLight.cDiffuse.xyz * cK;
+    #endif
+
+    pPass.cSpecularAcc += cSpecular * cK;                                                           // 1 alu
+
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half4 GetTerrainColor(sampler2D s, float2 terrainTC)
+{
+    return GetTerrainTex(s, terrainTC);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_ambient(inout fragPass pPass, inout half3 cAmbient)
+{
+    // Can't use Ambient from vertex since it get's clamped even though using float for color and since
+    // where are at the limit of interpolators, we'll do it by passing material diffuse color and SkyColor
+    // and modulate them on the fly .
+    cAmbient = half3(0, 0, 0);
+
+    half fBlendFactor = 1.0h;
+
+#if !%GRASS
+
+    fBlendFactor = (pPass.vNormal.z*0.25h+0.75h);           // 1 inst
+    cAmbient.xyz *= fBlendFactor;           // 1 inst
+#else
+    fBlendFactor = pPass.pCustom.cColor0.z;
+    cAmbient.xyz *= fBlendFactor; // 1 inst
+#endif
+
+    pPass.cAmbientAcc.xyz = cAmbient;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_end(inout fragPass pPass, inout half3 cFinal)
+{
+    half fOccFactor = 1.0;
+#if %GRASS
+    // Apply shadows to back-shading
+    half fOcclBackShadow = saturate(fOccFactor);                            // 1 alu
+    pPass.pCustom.cShadingBack.xyz *= fOcclBackShadow * pPass.pCustom.cFilterColor;                 // 2 alu
+    pPass.cBackDiffuseAcc = 1;
+    pPass.cDiffuseAcc += pPass.pCustom.cFrontLight.xyz * fOccFactor * pPass.pCustom.cFilterColor;   // 2 alu
+#endif
+
+    pPass.cDiffuseMap.xyz *= pPass.pCustom.cColor0.w;
+    pPass.cSpecularMap.xyz *= pPass.pCustom.cColor0.w;
+
+#if %_RT_BLEND_WITH_TERRAIN_COLOR && %_RT_AMBIENT
+    float2 texCoords = pPass.IN.baseTC.zw;
+    half4 terrainColor = GetTerrainColor(fromObjSampler0, texCoords);
+    pPass.cDiffuseMap.xyz = lerp(pPass.cDiffuseMap.xyz, terrainColor.xyz, pPass.IN.screenProj.z);
+    pPass.cSpecularMap.xyz = lerp(pPass.cSpecularMap.xyz, terrainColor.xyz, pPass.IN.screenProj.z);
+#endif
+
+    // Final composition
+    half3 cDiffuse = ((pPass.cAmbientAcc.xyz + pPass.cDiffuseAcc.xyz)  + pPass.cBackDiffuseAcc * pPass.pCustom.cShadingBack.xyz) * pPass.cDiffuseMap.xyz;
+    half3 cSpecular = pPass.cSpecularAcc.xyz * pPass.pCustom.fRenderQuality * pPass.cSpecularMap.xyz;
+
+    cFinal.xyz = cDiffuse + cSpecular;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "fragLib.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+EARLYDEPTHSTENCIL
+pixout VegetationPS(vtxOutVegetation IN)
+{
+    pixout OUT = (pixout) 0;
+
+    // Initialize fragPass structure
+    fragPass pPass = (fragPass) 0;
+
+#if %DETAIL_MAPPING
+    pPass.IN.detailTC = IN.detailTC.xy;
+#endif
+
+    frag_vegetation_unify(pPass, IN);
+
+    half4 cFinal = frag_shared_output(pPass);
+
+    float alphaTest = GetMaterial_AlphaTest();
+
+#if %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3
+    clip(pPass.cDiffuseMap.w - alphaTest);
+#endif
+
+#if %_RT_NOZPASS && %_RT_ALPHATEST
+    clip(pPass.cDiffuseMap.w - alphaTest);
+#endif
+
+    HDROutput(OUT, cFinal, 1);
+
+    return OUT;
+}
+
+#include "VegetationTess.cfi"
+
+//////////////////////////////// techniques ////////////////
+
+technique General
+<
+string Script =
+    "TechniqueZ=ZPass;"
+#if (%LEAVES || %BLENDLAYER) && !ENABLE_TESSELLATION
+    "TechniqueZPrepass=ZPrepass;"
+#endif
+
+#if !%GRASS
+    "TechniqueMotionBlur=MotionBlurPass;"
+#endif
+    "TechniqueShadowGen=ShadowGen;"
+    "TechniqueDebug=DebugPass;"
+    >
+{
+    pass p0
+    {
+        VertexShader = VegetationVS() VegetationVS;
+#ifdef ENABLE_TESSELLATION
+        HullShader   = VegetationHS() VegetationHS;
+        DomainShader = VegetationDS() VegetationDS;
+#endif
+        PixelShader = VegetationPS() VegetationPS;
+
+        ZEnable = true;
+        ZWriteEnable = true;
+
+#if (%GRASS || %LEAVES) && !%SPEEDTREE_BILLBOARD
+        CullMode = None;
+#else
+        CullMode = Back;
+#endif
+    }
+}
+
+//////////////////////////////// Common techniques ////////////////
+
+#if (%LEAVES || %BLENDLAYER) && !ENABLE_TESSELLATION
+    #include "CommonZPrePass.cfi"
+#endif
+
+#include "CommonZPass.cfi"
+
+#if !%GRASS
+  #include "CommonMotionBlurPass.cfi"
+#endif
+
+#include "ShadowCommon.cfi"
+#include "CommonShadowGenPass.cfi"
+#include "CommonDebugPass.cfi"
+
+/////////////////////// eof ///

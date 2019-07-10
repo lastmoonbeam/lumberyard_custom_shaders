@@ -1,0 +1,124 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+//=== Shared samplers =========================================================
+
+
+#define DIFFUSEMAP sampler2D diffuseMapSampler : register (s0) { Texture = $Diffuse; sRGBLookup = true; };
+#define NORMALMAP sampler2D normalMapSampler : register (s1) { string UIName = "Normal Map"; Texture = $Normal; };
+#define HEIGHTMAP sampler2D heightMapSampler { string UIName = "Height Map";  Texture = $Height; AddressU = Wrap; AddressV = Wrap; };
+#define SPECULARMAP sampler2D specularMapSampler : register (s2) { Texture = $Specular; sRGBLookup = true; };
+#define SMOOTHNESSMAP sampler2D smoothnessMapSampler { Texture = $Smoothness; };
+
+#define	dustLutSampler		normalMapSampler
+#define dustMapSampler		specularMapSampler
+#define	flowMapSampler		detailMapSampler
+#define	waxflowMapSampler	heightMapSampler
+
+#define TRANSLUCENCYMAP sampler2D translucencySampler = sampler_state { Texture = $Translucency; };
+#define OPACITYMAP sampler2D opacityMapSampler = sampler_state { Texture = $Opacity; };
+#define DETAILMAP sampler2D detailMapSampler = sampler_state { Texture = $Detail; sRGBLookup = true; };
+#define ENVIRONMENTMAP sampler2D envMapSampler : register (s3) { Texture = $Env; sRGBLookup = true; };
+#define ENVIRONMENTCUBEMAP samplerCUBE envMapSamplerCUBE : register (s3)   { Texture = $FromObjCM; AddressU = Clamp; AddressV = Clamp; };
+#define SUBSURFACEMAP sampler2D subsurfaceMapSampler = sampler_state { Texture = $Subsurface; sRGBLookup = true; };
+#define DECALMAP sampler2D decalMapSampler = sampler_state { Texture = $DecalOverlay; };
+
+#ifdef %ST_FIXED_POINT
+#define SCENEDEPTHMAP  \
+Texture2D <uint> sceneDepthSampler : TS_ZTarget;
+#else
+#define SCENEDEPTHMAP  \
+sampler2D sceneDepthSampler = sampler_state \
+{ \
+	Texture = $ZTarget; \
+	MinFilter = POINT; \
+	MagFilter = POINT; \
+	MipFilter = POINT; \
+	AddressU = Clamp; \
+	AddressV = Clamp; \
+};
+#endif
+
+#define SCENE_NORMALS_MAP  \
+sampler2D sceneNormalsSampler : register (s12) \
+{ \
+  Texture = $SceneNormalsMap; \
+  MinFilter = POINT; \
+  MagFilter = POINT; \
+  MipFilter = POINT; \
+  AddressU = Clamp; \
+  AddressV = Clamp; \
+  Global = true;    \
+}; \
+
+#define SCENE_NORMALS_BENT  \
+sampler2D sceneNormalsBentSampler : register (s11) \
+{ \
+  Texture = $SceneNormalsBent; \
+  MinFilter = POINT; \
+  MagFilter = POINT; \
+  MipFilter = POINT; \
+  AddressU = Clamp; \
+  AddressV = Clamp; \
+  Global = true;    \
+}; \
+
+#define SCENE_DIFFUSEACC_MAP  \
+sampler2D sceneDiffuseAccSampler : register (s13) \
+{ \
+  Texture = $SceneDiffuseAcc; \
+  MinFilter = POINT; \
+  MagFilter = POINT; \
+  MipFilter = POINT; \
+  AddressU = Clamp; \
+  AddressV = Clamp; \
+  Global = true;    \
+}; \
+
+#define SCENE_SPECULARACC_MAP  \
+sampler2D sceneSpecularAccSampler : register (s10) \
+{ \
+  Texture = $SceneSpecularAcc; \
+  MinFilter = POINT; \
+  MagFilter = POINT; \
+  MipFilter = POINT; \
+  AddressU = Clamp; \
+  AddressV = Clamp; \
+  Global = true;    \
+}; \
+
+#define CLOUD_SHADOW_MAP \
+sampler2D cloudShadowMap = sampler_state \
+{ \
+ Texture = $CloudsLM; \
+ MinFilter = LINEAR; \
+ MagFilter = LINEAR; \
+ MipFilter = POINT; \
+ AddressU = Wrap; \
+ AddressV = Wrap; \
+};
+
+#define DEFAULT_CUBE_MAP \
+samplerCUBE defaultProbeSamplerCUBE : register (s3)\
+{ \
+  Texture = $DefaultEnvironmentProbe; \
+  MinFilter = LINEAR; \
+  MagFilter = LINEAR; \
+  MipFilter = LINEAR; \
+  AddressU = Clamp; \
+  AddressV = Clamp; \
+  AddressW = Clamp;	\
+};
+
+SamplerState TrilinearClampSamplerState : SS_TrilinearClamp;
+

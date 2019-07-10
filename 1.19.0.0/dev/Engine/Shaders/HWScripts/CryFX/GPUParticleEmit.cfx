@@ -1,0 +1,438 @@
+#include "GPUParticle.cfi"
+#include "GPUParticleHelpers.cfi"
+
+#define MAX_ITERATIONS_UNIFORM_POINT_GENERATION (8)
+#define MAX_ITERATIONS_UNIFORM_POINT_GENERATION_MIN_ONE (MAX_ITERATIONS_UNIFORM_POINT_GENERATION - 1)
+#define EPSILON (1e-4)
+
+
+float4 SpawnInfo;                                                       // .x:NumSpawned
+float4 ParticleFrameInfo0;                                              // .x:DeltaTime .y:Time .z:unused .w:bufferOffset
+float4 CameraPosition;                                                  // .xyz Position
+
+RWStructuredBuffer<Particle> ParticleData : register(u1);               // per-particle data
+RWStructuredBuffer<float> ParticleSortDistances : register(u2);         // per-particle sort score
+StructuredBuffer<int> ParticleDeadlist : register(t7);                  // per-emitter particle dead list (read only)
+
+// spawn parameters
+float4 sp_particleScaleXY_globalScale_speedScale;
+
+float4 ed_life_random;
+float4 ed_scalexy_random;
+float4 ed_color;
+float4 ed_color_random;
+float4 ed_color_random_range;
+float4 ed_colorEmtStrength;
+float4 ed_colorEmtStrength_random;
+float4 ed_positionOffset;
+float4 ed_positionOffset_random;
+float4 ed_drag_random;
+float4 ed_acceleration_gravity;
+float4 ed_world_position_delta;
+float4 ed_offset_roundness_fraction_emitangle_random;
+float4 ed_rotationInit_rotationRateXrandom;
+float4 ed_rotationRandom_rotationRateYrandom;
+float4 ed_rotationRate_rotationRateZrandom;
+float4 ed_pivotXY;
+float4 ed_flags_collisionRadius;
+float4 ed_stretch;
+float4 ed_focus_direction;
+float4 ed_spawnPosXYZ;
+float4 ed_spawnPosXYZRandRange;
+float4 ed_spawnPosXYZRandom;
+float4 ed_spawnPosXYZRandomRandRange;
+float4 ed_velSpreadSpawnOffset;
+float4 ed_paramVelocityXYZ;
+float4 ed_emitterSizeXYZ;
+float4 ed_emitterSizeXYZRand;
+float4 ed_emitterSizeX;
+float4 ed_spawnPosIncrementXYZ;
+float4 ed_spawnPosIncrementXYZRandRange;
+float4 ed_spawnPosIncrementXYZRandom;
+float4 ed_spawnPosIncrementXYZRandomRandRange;
+float4 ed_emitterIncrementXYZprev; // TODO: Move emitter increment to the GPU. Then this variable can be deleted.
+float4 ed_world_position;
+
+float4x4 ed_world;
+float4x4 ed_world_rotation;
+
+float3 GenerateRandomPositionOffset(inout uint rndState, float3 vRandomOffset, float fOffsetRoundness, float fOffsetInnerFraction)
+{
+    // PER EMITTER
+    // Emission bounds parameters
+    float3 vEmitBox = vRandomOffset;
+    float3 vEmitScale = float3(0.0, 0.0, 0.0);
+
+    // offset roundsness determines the amount of rounding that is being performed on the box within we emit
+    // 1 will result in a sphere for a spawn volume xyz = n, and 0 will be result in a cube for spawn volume xyz = n
+    // values in between wil chamfer the box towards the sphere (note that this can be non-uniform as we dont require a uniform box)
+    if (fOffsetRoundness > 0.0)
+    {
+        // first the maximum distance is found and scaled with the offset roundness
+        float fRound = fOffsetRoundness * max(max(vEmitBox.x,vEmitBox.y), vEmitBox.z);
+        
+        // clamp the the minimum value to the minimum value with the upper bound of the maximum distance
+        float3 vRound = float3( min(vEmitBox.x, fRound),
+                                min(vEmitBox.y, fRound), 
+                                min(vEmitBox.z, fRound) );
+                                
+        // minimize the area on which to spawn the new particles depending on the roundness
+        // when roundness is 1, we will create the spawn area based on radius instead of the area of the cube
+        vEmitBox -= vRound;
+        
+        // calculate the normalization for the area in which to spawn the new particles, this gets used for the bound check
+        vEmitScale = float3( vRound.x ? 1.0/vRound.x : 0.0, 
+                             vRound.y ? 1.0/vRound.y : 0.0, 
+                             vRound.z ? 1.0/vRound.z : 0.0 );
+    }
+    
+    // PER PARTICLE
+    float3 vOffset;
+    
+    // loop until random point is within rounded volume.
+    for(int i=0; i<MAX_ITERATIONS_UNIFORM_POINT_GENERATION; i++)
+    {
+        float NaN = asfloat(0x7FBFFFFF);
+        if(i == MAX_ITERATIONS_UNIFORM_POINT_GENERATION_MIN_ONE)
+            return float3(NaN,NaN,NaN); // create degenerate position of type NaN (Not a number), this then gets clipped by the rasterizer
+            
+        // generate a random point within the cube min(-1) max(1) where the particle will spawn
+        vOffset = rand_neg1To1_float3(rndState);
+            
+        // scale this point to the random offset range
+        vOffset *= vRandomOffset;
+        
+        if (fOffsetRoundness > 0.0)
+        {
+            // create a vector from 0 towards the random generated point, in positive half space, and normalize using vEmitScale
+            float3 vR = max(abs(vOffset)-vEmitBox, float3(0.0,0.0,0.0)) * vEmitScale;
+        
+            // check if vector is inside the sphere by checking the radius
+            if (dot(vR, vR) > 1.0)
+                continue;
+        }
+        // apply inner volume subtraction.
+        // offsetInnerFraction is the offset from the center from which we start spawning particles
+        // offsetInnerFraction == 0.0, particles are spawned within the shape; range from 0 - vEmitBox (+ radius when offsetRoundness > 0)
+        // offsetInnerFraction == 1.0, particles are spawned on the shape; vEmitBox (+ radius when offsetRoundness > 0)
+        if (fOffsetInnerFraction > 0.0)
+        {
+            // calculate the maximum scale, when div by 0 occurs the min() always results the maximum float value, similar behaviour as CPU particles
+            const float scaleMax =
+                div_min(
+                    vRandomOffset.x,
+                    abs(vOffset.x),
+                    div_min(
+                        vRandomOffset.y,
+                        abs(vOffset.y),
+                        div_min(
+                            vRandomOffset.z,
+                            abs(vOffset.z),
+                            FLT_MAX
+                        )
+                    )
+                );
+                
+            float3 vOffsetMax = vOffset * scaleMax;
+            
+            if (fOffsetRoundness > 0.0)
+            {
+                // calculate the maximum radius on 3 axis
+                float3 vRadiusMax = max(abs(vOffsetMax) - vEmitBox, float3(0.0,0.0,0.0));
+                            
+                float maxSqr = dot(vRadiusMax * vEmitScale,vRadiusMax * vEmitScale);
+                if(maxSqr > 0.0)
+                {
+                    float r = rsqrt(maxSqr);
+                    vRadiusMax *= r;
+                
+                // we dont really lerp since step returns 0 or 1
+                // here we calculate the radius offset from the random generated offset towards the shell of the shape
+                vOffsetMax = lerp(vOffsetMax, (vEmitBox + vRadiusMax) * sign(vOffsetMax), step(0.000001, vRadiusMax));
+            }
+            }
+
+            // interpolate between current and max offsets
+            vOffset += (vOffsetMax - vOffset) * fOffsetInnerFraction;
+        }
+
+        break;
+    }
+    return vOffset;
+}
+
+float3 GenerateParticlePosition(inout uint rndState, float3 vInitVel, float spawnFactor)
+{
+    // Particle position offset
+    float3 particleOffset = float3(0, 0, 0);
+    {
+        float3 spawnPosXYZ = ed_spawnPosXYZ.xyz + ed_spawnPosXYZRandRange.xyz * rand_0To1_float3(rndState);
+        float3 spawnPosXYZRandom = (ed_spawnPosXYZRandom.xyz + ed_spawnPosXYZRandomRandRange.xyz * rand_0To1_float3(rndState)) * rand_neg1To1_float3(rndState);
+
+        float3 spawnPos = spawnPosXYZ + spawnPosXYZRandom; 
+
+#if %_RT_GPU_PARTICLE_SHAPE_SPHERE || %_RT_GPU_PARTICLE_SHAPE_CIRCLE    
+        {
+            // TODO: Move emitter increment to the GPU. This line is where the random increment will be calculated.
+            //float3 incrementRand = (ed_spawnPosIncrementXYZRandom.xyz + ed_spawnPosIncrementXYZRandomRandRange.xyz * rand_0To1_float3(rndState)) * rand_neg1To1_float3(rndState);
+
+            float radius = (ed_emitterSizeX.x + ed_emitterSizeX.y * rand_0To1_float(rndState)) * 0.5;
+            float circumference = PI * 2.0 * radius;
+            const float percentageToUniformScale = 0.01;
+        
+            // emitterIncrementXYZ is packed in the w component of the three spawnPosIncrement constants
+            float3 emitterIncrementXYZ = float3(ed_spawnPosIncrementXYZ.w, ed_spawnPosIncrementXYZRandRange.w, ed_spawnPosIncrementXYZRandom.w);
+
+            float3 emitterIncrementXYZprev = float3(ed_emitterIncrementXYZprev.x, ed_emitterIncrementXYZprev.y, ed_emitterIncrementXYZprev.z);
+            float3 globalIncrement = lerp(emitterIncrementXYZprev, emitterIncrementXYZ, spawnFactor);
+            
+            float3 globalIncrementPercentage = percentageToUniformScale * globalIncrement;
+
+            float scaleOverX = fmod(globalIncrementPercentage.x, 1.0f); 
+            float positionIncrementX = scaleOverX * radius;
+            float offsetX = -(radius + spawnPos.x + positionIncrementX);
+
+#if %_RT_GPU_PARTICLE_SHAPE_SPHERE
+            {
+                particleOffset = float3(0,offsetX,0);
+
+                if(radius > 0.0)
+                {
+                    float2 radians = (spawnPos.yz + circumference * globalIncrementPercentage.yz) / radius;
+
+                    float yAngleInRad = PI * 0.5 - radians.x;
+                    float zAngleInRad = -radians.y;
+
+                    particleOffset.x = -cos(yAngleInRad) * cos(zAngleInRad) * offsetX;
+                    particleOffset.y = sin(yAngleInRad) * offsetX;
+                    particleOffset.z = -cos(yAngleInRad) * sin(zAngleInRad) * offsetX;
+                }
+            }
+#elif %_RT_GPU_PARTICLE_SHAPE_CIRCLE
+            {
+                float scaleOverZ = frac(globalIncrementPercentage.z);
+                float positionIncrementZ = scaleOverZ * radius;
+                float offsetZ = spawnPos.z + positionIncrementZ;
+
+                particleOffset = float3(0,offsetX,offsetZ);
+
+                if(radius > 0.0)
+                {
+                    float radians = circumference * globalIncrementPercentage.y;
+                    const float angleInRad = PI * 0.5 + (spawnPos.y + radians) / radius;
+                    particleOffset.xy = float2(cos(angleInRad),sin(angleInRad)) * offsetX;
+                }
+            }
+#endif
+        }
+#elif %_RT_GPU_PARTICLE_SHAPE_POINT
+        {
+            float spawnOffset = ed_velSpreadSpawnOffset.z + ed_velSpreadSpawnOffset.w * rand_0To1_float(rndState);
+            particleOffset = spawnPosXYZ + spawnPosXYZRandom;
+            particleOffset += vInitVel * spawnOffset;
+        }
+#elif %_RT_GPU_PARTICLE_SHAPE_BOX
+        {
+            float3 emitterSize = ed_emitterSizeXYZ.xyz + ed_emitterSizeXYZRand.xyz * rand_0To1_float(rndState);
+            particleOffset = emitterSize * float3(0.5,-0.5,-0.5) + spawnPosXYZ + spawnPosXYZRandom;
+        }
+#endif
+    }
+    return particleOffset;
+}
+
+float3 GeneratePointEmitterVelocity(inout uint rndState)
+{
+    float velocitySpread = ed_velSpreadSpawnOffset.x + ed_velSpreadSpawnOffset.y * rand_0To1_float(rndState);
+    float halfConeCosInRad = cos(DEG2RAD * 0.5 * velocitySpread);
+
+    float z = rand_uintToFloat(rand_lcg(rndState)) * (1.0 - halfConeCosInRad) + halfConeCosInRad;
+    float phi = rand_uintToFloat(rand_lcg(rndState)) * PI * 2.0;
+    float sqrtOneMinZsqr = sqrt(1.0 - z * z);
+    float x = sqrtOneMinZsqr * cos(phi);
+    float y = sqrtOneMinZsqr * sin(phi);
+    
+    float3 position = float3(x, y, z);
+    float3 dir = ed_paramVelocityXYZ.xyz;
+
+    [branch]
+    if (any(dir))
+    {
+        float4 quat = quatCreateRotation(float3(0, 0, 1), normalize(dir));
+        position = normalize(quatRotatePoint(quat, position));
+    }
+
+    return position;
+}
+
+float3 GenerateAngleEmitterVelocity(inout uint rndState, float3 randomRange)
+{
+    //this is the basic random, on the CPU side this gets multiplied by maxAngle,
+    //but since we would immediately divide by it again, we don't bother
+    float phi = 1.0 - rand_uintToFloat(rand_lcg(rndState)) * randomRange;
+
+    //angle adjusted to be uniform
+    phi = acos(1.0 + phi * (cos(ed_offset_roundness_fraction_emitangle_random.z) - 1));
+    float theta = rand_uintToFloat(rand_lcg(rndState)) * 2.0 * PI;
+
+    float sin_phi, cos_phi;
+    float sin_theta, cos_theta;
+
+    sincos(phi, sin_phi, cos_phi);
+    sincos(theta, sin_theta, cos_theta);
+
+    //take focus direction into account
+    //find two perpendicular axes
+    float3 vec_x;
+    if (abs(ed_focus_direction.z) > EPSILON)
+    {
+        vec_x = float3(0.0, -ed_focus_direction.z, ed_focus_direction.y);
+    }
+    else
+    {
+        vec_x = float3(-ed_focus_direction.y, ed_focus_direction.x, 0.0);
+    }
+    vec_x = normalize(vec_x);
+    float3 vec_y = cross(ed_focus_direction.xyz, vec_x);
+
+    return ed_focus_direction.xyz * cos_phi + (vec_x * cos_theta + vec_y * sin_theta) * sin_phi;
+}
+
+void RespawnParticle(inout Particle p, uint3 DispatchThreadId, uint SpawnID)
+{
+    const float DeltaTime = ParticleFrameInfo0.x;
+    const float Time = ParticleFrameInfo0.y;
+    
+    // time gets multiplied with 1231.0 (prime number) to get a broader range of randomness with an arbitrary prime number higher than 10^3
+    // as a primenumber has no divisors there is a better chance on a getting a unique number
+    // experiments have shown 1231.0 results in a subjective good looking initial random seed
+    uint rndState = wang_hash(DispatchThreadId.x*uint(Time*1231.0));
+    rand_xorshift(rndState); // improve randomness by doing one xorshift iteration
+
+    // random lifetime
+    p.life = rand_uintToFloat(rand_lcg(rndState))*ed_life_random.y+ed_life_random.x;
+    p.lifeMax = p.life;
+    p.deltaTime = 0.0; // 0.0 indicates the particle was just spawned
+    
+    // emitter offset
+    float3 emitterOffset = ed_positionOffset.xyz + GenerateRandomPositionOffset(rndState, ed_positionOffset_random.xyz, ed_offset_roundness_fraction_emitangle_random.x, ed_offset_roundness_fraction_emitangle_random.y);
+   
+    // velocity   
+#if %_RT_GPU_PARTICLE_SHAPE_POINT 
+    p.velocity.xyz = GeneratePointEmitterVelocity(rndState);
+#elif %_RT_GPU_PARTICLE_SHAPE_ANGLE   
+    p.velocity.xyz = GenerateAngleEmitterVelocity(rndState, emitterOffset);
+#else
+    p.velocity.xyz = float3(0, 0, 0);
+#endif
+
+    const float numSpawnParticles = SpawnInfo.x;
+    const float spawnFactor = (float(SpawnID)/numSpawnParticles);
+
+    // particle position offset
+    float3 particleOffset = GenerateParticlePosition(rndState, p.velocity.xyz, spawnFactor);
+
+    p.position.xyz = emitterOffset + particleOffset;
+    
+    // move to world position
+    p.position.xyz = mul(ed_world, float4(p.position.xyz, 1.0)).xyz;
+
+    // pack original particle pos
+    p.position.w = emitterOffset.x + ed_world_position.x;
+    p.velocity.w = emitterOffset.y + ed_world_position.y;
+    p.rotation.w = emitterOffset.z + ed_world_position.z;
+    
+#if %_RT_MOTION_BLUR
+    p.previous_position_xy = p.position.xy;
+    p.previous_rotation_pos_z.w = p.position.z;
+#endif
+
+    // calculate speed
+    float speed = ed_life_random.z + rand_0To1_float(rndState) * ed_life_random.w;
+    speed *= sp_particleScaleXY_globalScale_speedScale.w;
+    
+    // calculate start velocity
+    p.velocity.xyz *= speed;
+    
+    // transform velocity to world space
+    p.velocity.xyz = mul(ed_world_rotation, float4(p.velocity.xyz,0)).xyz;
+    
+    // random color & random emitter strength color
+    p.rgba = ed_color + ed_color_random * rand_uintToFloat(rand_lcg(rndState));
+    p.rgba *= ed_color_random_range;
+    p.rgba *= ed_colorEmtStrength + ed_colorEmtStrength_random * rand_uintToFloat(rand_lcg(rndState));
+    
+    // generate scale base
+    p.scale.x = ed_scalexy_random.x + rand_uintToFloat(rand_lcg(rndState)) * ed_scalexy_random.y;
+    p.scale.y = ed_scalexy_random.z + rand_uintToFloat(rand_lcg(rndState)) * ed_scalexy_random.w;
+    
+    // spawn parameter scaling
+    // Global Size Scale has to be applied here even though it is also part of the emitter's modelView matrix because modelView is apparently not used when generating particle geometry.
+    p.scale.x *= sp_particleScaleXY_globalScale_speedScale.z * sp_particleScaleXY_globalScale_speedScale.x;
+    p.scale.y *= sp_particleScaleXY_globalScale_speedScale.z * sp_particleScaleXY_globalScale_speedScale.y;
+    
+    // generate random source for misc parameters
+    p.random0 = rand_lcg(rndState);
+    
+
+    // position substepping based on particle velocity
+    p.position.xyz += p.velocity.xyz * spawnFactor * DeltaTime;
+    // position substepping based on emitter movement
+    p.position.xyz -= ed_world_position_delta.xyz * spawnFactor;
+    // reduce the particle's time for accurate substepping of death when DeltaTime is long (i.e. during Pre-Roll/priming)
+    p.life -= DeltaTime * spawnFactor;
+    
+    // velocity inheritance (stored in ed_positionOffset_random.w)
+    p.velocity.xyz += ed_positionOffset_random.w * (ed_world_position_delta.xyz * (1.0/ParticleFrameInfo0.x));
+    
+    // generate rotation base
+    float randX = rand_uintToFloat(rand_lcg(rndState));
+    float randY = rand_uintToFloat(rand_lcg(rndState));
+    float randZ = rand_uintToFloat(rand_lcg(rndState));
+    float3 initialRandomRotation = float3(randX * ed_rotationInit_rotationRateXrandom.w, 
+                                          randY * ed_rotationRandom_rotationRateYrandom.w, 
+                                          randZ * ed_rotationRate_rotationRateZrandom.w) 
+                                        + ed_rotationInit_rotationRateXrandom.xyz;
+                                        
+    randX = rand_uintToFloat(rand_lcg(rndState));
+    randY = rand_uintToFloat(rand_lcg(rndState));
+    randZ = rand_uintToFloat(rand_lcg(rndState));
+    p.rotation.xyz = degreesToRadians(ed_rotationRandom_rotationRateYrandom.xyz * float3(randX,randY,randZ) + initialRandomRotation);
+    
+#if %_RT_MOTION_BLUR
+    p.previous_rotation_pos_z.xyz = p.rotation.xyz;
+#endif
+    p.pivotXY.x = ed_pivotXY.x + rand_uintToFloat(rand_lcg(rndState)) * ed_pivotXY.y;
+    p.pivotXY.y = ed_pivotXY.z + rand_uintToFloat(rand_lcg(rndState)) * ed_pivotXY.w;
+    
+    p.stretch = ed_stretch.x + rand_uintToFloat(rand_lcg(rndState)) * ed_stretch.y;
+    
+    // set the per particle flags
+    p.flags = asuint(ed_flags_collisionRadius.x);
+}
+
+[numthreads(128, 1, 1)]                                 
+void CS(
+    uint3 GroupId : SV_GroupID,
+    uint3 DispatchThreadId : SV_DispatchThreadID,       
+    uint3 GroupThreadId : SV_GroupThreadID,             
+    uint GroupIndex: SV_GroupIndex)
+{
+    if(DispatchThreadId.x >= SpawnInfo.x)
+        return;
+        
+    int bufferOffset = asint(ParticleFrameInfo0.w);
+        
+    uint3 ParticleDispatchId = uint3(ParticleDeadlist[DispatchThreadId.x + bufferOffset], 0, 0);
+    RespawnParticle(ParticleData[ParticleDispatchId.x], ParticleDispatchId, DispatchThreadId.x);
+    ParticleSortDistances[ParticleDispatchId.x] = getSortScore(CameraPosition.xyz, ParticleData[ParticleDispatchId.x].position.xyz);
+}
+
+// Default technique
+technique Default
+{
+    pass p0
+    {
+        ComputeShader = CS() GPUParticleCS;
+    }
+}

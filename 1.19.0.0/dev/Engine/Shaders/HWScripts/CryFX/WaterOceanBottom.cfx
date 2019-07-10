@@ -1,0 +1,187 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+// WaterOceanBottom: used as closing cap for missing terrain until horizon
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+    string Script =
+        "NoPreview;"
+        "ForceDrawLast;"
+        "ShaderDrawType = General;"
+        "ShaderType = General;"
+>;
+
+/// Un-Tweakables //////////////////////
+float4x4 mViewProj : PI_Composite < vsregister = c0; >; // view projection matrix
+float4x4 mViewProjI : PB_UnProjMatrix;  // invert( view projection matrix )
+float4x4 mWorldT : PI_TransObjMatrix < vsregister = c4; >;
+
+const static float MIN_WATER_DEPTH = 5.0f;
+
+float4x4 mReflProj : PI_TexMatrix
+<
+    string 'Sampler' (envMapSamplerRefl)
+>;
+
+struct a2vWater
+{
+    float4 Position : POSITION;
+
+    float2 baseTC    : TEXCOORD;
+    float4 Color     : COLOR;
+};
+
+struct v2fWaterBottom
+{
+    float4 Position  : POSITION; 
+};
+
+struct v2fWaterBottomZpass
+{
+    float4 Position  : POSITION; 
+};
+
+// Get vertex from screen space into world spasace
+void GetGridVertexPos( inout float4 vPos )
+{ 
+    // Make the screen aligned (-1.0 to 1.0) grid slightly larger. This is much cheaper
+    // and less complicated than solving the horizon along screen edges perfectly, and
+    // works just as well.
+    vPos.xy *= 2.0f;
+    
+    // Make ocean bottom -0.1 or MIN_WATER_DEPTH less than the water level, whichever is
+    // less. -0.1 is used to help mitigate z-fighting with TAA along the edges of terrain.
+    float oceanBottomPosition = min(PerFrame_WaterLevel.x - MIN_WATER_DEPTH, -0.1f);
+
+    // Inverse project the screen space coords back to world space.
+    float4 vPosWS = mul( mViewProjI, vPos );
+    vPosWS /= vPosWS.w;
+
+    // Calculate the ratio of the distance from the ocean bottom plane to the z offset of 
+    // the grid from the camera z. This can be used to calculate an intersection point on
+    // ocean bottom.
+    float2 zHeightRatio = float2(PerView_WorldViewPos.z - vPosWS.z, PerView_WorldViewPos.z - oceanBottomPosition);
+
+    // Make sure that x is positive and above zero. This both eliminates divide by zero errors
+    // and makes sure that grid points don't project backwards.
+    zHeightRatio.x = max(0.000001f, zHeightRatio.x);
+
+    // Calculate how much longer the ray from the camera to the grid point needs to be to 
+    // intersect with the ocean bottom plane.
+    float rayMultiplier = zHeightRatio.y / zHeightRatio.x;
+
+    // project vertex along ray direction
+    float2 vRayDir = (vPosWS.xyz - PerView_WorldViewPos.xyz);        
+    vPos.xy = PerView_WorldViewPos.xy + vRayDir * rayMultiplier;
+
+    // Clamp the z position in world space to the ocean bottom's position.
+    vPos.z = oceanBottomPosition;
+
+    // Move back into projected space.
+    vPos = mul(mViewProj, vPos);
+}
+
+///////////////// Ocean bottom  //////////////////
+
+v2fWaterBottom OceanBottomVS(a2vWater IN)
+{
+    v2fWaterBottom OUT = (v2fWaterBottom)1; 
+  
+    // Position in screen space.
+    float4 vPos = IN.Position;
+    GetGridVertexPos( vPos );
+
+    OUT.Position = vPos;
+    return OUT;
+}
+
+pixout OceanBottomPS( v2fWaterBottom IN )
+{
+    pixout OUT = (pixout) 0;
+    OUT.Color.xyz = float3(0,0,0);
+    OUT.Color.w = 1;
+    return OUT;
+}
+
+
+v2fWaterBottomZpass OceanBottomZpassVS(a2vWater IN)
+{
+    v2fWaterBottomZpass OUT = (v2fWaterBottomZpass)0; 
+
+    // Position in screen space.
+    float4 vPos = IN.Position;
+    GetGridVertexPos( vPos );
+    vPos.w -= 0.01;
+    OUT.Position = vPos;
+    return OUT;
+}
+
+#if GMEM
+    // We linearize depth in ZPASS during GMEM path.
+    float4 NearProjection;
+#endif
+
+pixout_gbuffer OceanBottomZpassPS( v2fWaterBottomZpass IN )
+{
+    pixout_gbuffer OUT;
+
+    MaterialAttribsCommon attribs = MaterialAttribsDefault();
+    EncodeGBuffer( attribs, OUT.GBufferA, OUT.GBufferB, OUT.GBufferC );
+
+    #if FEATURE_GMEM_LINEARIZE_DEPTH
+        // Comments about this GMEM code can be found in CommonZPass.cfi
+        OUT.LinDepthResSten.x = saturate(IN.Position.w * PerView_ProjRatio.w);
+    #endif
+
+    return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique General
+<
+    string Script = 
+    "TechniqueZ=ZPass;"
+>
+{  
+    pass p0
+    {    
+        ZEnable = true;
+        ZFunc = Equal;
+        ZWriteEnable = false;
+        CullMode = None; 
+        IgnoreMaterialState = true;
+        ColorWriteEnable = 0;
+
+        VertexShader = OceanBottomVS() GeneralVS;
+        PixelShader = OceanBottomPS() GeneralPS;
+    }
+}
+
+technique ZPass
+{
+    pass p0
+    {
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = None; 
+        IgnoreMaterialState = true;
+
+        VertexShader = OceanBottomZpassVS() ZVS;
+        PixelShader = OceanBottomZpassPS() ZPS;
+    }
+}

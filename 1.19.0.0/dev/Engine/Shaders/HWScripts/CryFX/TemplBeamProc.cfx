@@ -1,0 +1,284 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "ModificatorVT.cfi"
+#include "ModificatorTC.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "Public;"
+           "ShaderDrawType = General;"
+           "ShaderType = FX;"
+>;
+
+// Tweakables /////////////////
+
+float BeamLength
+<
+  register = PER_MATERIAL_1.y;
+  string UIWidget = "slider";
+  string UIName = "Length";
+  float UIMin = 0.0;
+  float UIMax = 20.0;
+  float UIStep = 0.01;
+> = 10;
+
+float OrigLength
+<
+  register = PER_MATERIAL_1.z;
+  string UIWidget = "slider";
+  string UIName = "OriginalLength";
+  float UIMin = 0.0;
+  float UIMax = 20.0;
+  float UIStep = 0.01;
+> = 10;
+
+float OrigWidth
+<
+  register = PER_MATERIAL_1.w;
+  string UIWidget = "slider";
+  string UIName = "OriginalWidth";
+  float UIMin = 0.0;
+  float UIMax = 10.0;
+  float UIStep = 0.01;
+> = 1;
+
+float StartRadius
+<
+  register = PER_MATERIAL_2.x;
+  string UIWidget = "slider";
+  string UIName = "StartRadius";
+  float UIMin = 0.0;
+  float UIMax = 10.0;
+  float UIStep = 0.01;
+> = 1;
+
+float EndRadius
+<
+  register = PER_MATERIAL_2.y;
+  string UIWidget = "slider";
+  string UIName = "EndRadius";
+  float UIMin = 0.0;
+  float UIMax = 10.0;
+  float UIStep = 0.01;
+> = 2;
+
+float FinalMultiplier
+<
+  register = PER_MATERIAL_2.z;
+  string UIWidget = "slider";
+  string UIName = "ColorMultiplier";
+  float UIMin = 0.0;
+  float UIMax = 32.0;
+  float UIStep = 0.01;
+> = 1.0;
+
+float SoftIntersectionFactor
+<
+  register = PER_MATERIAL_2.w;
+  string UIHelp = "Controls softness of water surface intersection with other opaque scene geometry";                   
+  string UIName = "Soft intersection factor";      
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 10.0;
+  float UIStep = 0.1;  
+> = 1.0;
+
+float viewDependencyFactor
+<
+  register = PER_MATERIAL_1.x;
+  string UIHelp = "Controls view dependence attenuation";                   
+  string UIName = "View dependency factor";      
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 10.0;
+  float UIStep = 0.1;  
+> = 2.0;
+
+float4 StartColor
+<
+  register = PER_MATERIAL_3;
+  string UIWidget = "color";
+  string UIName = "StartColor";
+  float UIMin = 0.0;
+  float UIMax = 4.0;
+  float UIStep = 0.01;
+> = {1.0, 1.0, 1.0, 1.0};
+
+float4 EndColor
+<
+  register = PER_MATERIAL_4;
+  string UIWidget = "color";
+  string UIName = "EndColor";
+  float UIMin = 0.0;
+  float UIMax = 4.0;
+  float UIStep = 0.01;
+> = {1.0, 1.0, 1.0, 0.0};
+
+
+sampler2D TexSampler = sampler_state
+{
+  Texture = $White;
+};
+
+sampler3D noiseMapSampler = sampler_state
+{
+  Texture = EngineAssets/Textures/Noise3D.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+  AddressW = Wrap;
+}
+
+/////////////////////////////
+
+struct v2f
+{
+  float4 HPosition  : POSITION;  //in projection space
+  float4 baseTC    : TEXCOORDN; 
+  float4 screenProj : TEXCOORDN; 
+  half4 Color     : TEXCOORDN; 
+#if %NOISE
+  half4 noiseTC    : TEXCOORDN;
+#endif  
+
+};
+
+///////////////// vertex shader //////////////////
+
+v2f TemplBeamVS(app2vertGeneral IN)
+{
+    v2f OUT = (v2f)0; 
+
+    streamPos vertPassPos = (streamPos)0;
+    streamPos_FromGeneral(IN, vertPassPos);
+
+    float4 color = 1;
+    float fLerp = 1;
+#if !%MUZZLEFLASH
+    float fiOLength = 1/ OrigLength ;
+
+    // fLerp = vrt->x/OrigLength
+    fLerp = vertPassPos.Position.x * fiOLength ;
+
+    vertPassPos.Position.x = fLerp * BeamLength ;
+
+    // fCurRadius = Lerp(StartRadius, EndRadius, fLerp)
+    float fCurRadius = lerp( StartRadius, EndRadius , fLerp) ;
+    float fiOrigWidth = 1 / OrigWidth ;
+
+    vertPassPos.Position.yz = vertPassPos.Position.yz * fiOrigWidth * fCurRadius ;
+
+    // srgb correction - only way withouth adding permutation
+    StartColor.xyz *= StartColor.xyz;
+    EndColor.xyz *= EndColor.xyz;
+    PerMaterial_DiffuseColor.xyz *= PerMaterial_DiffuseColor.xyz;
+
+    color = StartColor * saturate(1 - fLerp) + EndColor * fLerp;
+
+#endif
+
+    OUT.baseTC = vertPassPos.baseTC;
+    OUT.HPosition = Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos);
+
+    // Preparing the inverse non-uniform matrix for correct vector transform
+    float3x3 instInvScaleMat = InverseScaleMatrixFast((const float3x3)vertPassPos.InstMatrix);
+
+    // Compensating for non-uniform scale
+    float3 normalWS = normalize(mul(instInvScaleMat, vertPassPos.ObjToTangentSpace[2]));
+    float3 viewWS = normalize(PerView_WorldViewPos.xyz - vertPassPos.WorldPos.xyz);
+
+    float d = dot(viewWS, normalWS);
+    d *= d;
+    d = saturate( d  * viewDependencyFactor );
+
+    // srgb tweak - square attenuation factor - smoother edges
+    d *= d;
+
+    color.xyz *=  PerMaterial_DiffuseColor;
+    OUT.Color = FinalMultiplier * color * d;
+
+    // Output projected texture coordinates
+    OUT.screenProj = HPosToScreenTC( OUT.HPosition );
+
+#if %NOISE
+    // disabled public parameters usage atm, since there's some issue with it + shadows active at same time
+    float4 noiseGen = float4(0.05, 0, 0, PerView_AnimGenParams.z*0.1);
+    OUT.noiseTC.x = dot(vertPassPos.Position, noiseGen);
+    noiseGen = float4(0, 0.05, 0, PerView_AnimGenParams.z*0.15);
+    OUT.noiseTC.y = dot(vertPassPos.Position, noiseGen);
+    noiseGen = float4(0, 0, 0.1, PerView_AnimGenParams.z*0.05);
+    OUT.noiseTC.z = dot(vertPassPos.Position, noiseGen);
+#endif 
+
+    float4 baseTC = vertPassPos.baseTC;  
+    _ModifyUV_1(baseTC, OUT.baseTC, vertPassPos.Position );
+
+    return OUT;
+}
+
+
+///////////////// pixel shader //////////////////
+
+pixout TemplBeamPS(v2f IN)
+{
+  pixout OUT;
+
+  // load the base
+  half4 baseTex = GetTexture2D(diffuseMapSampler, IN.baseTC.xy);  
+  float sceneDepth = DecodeSceneDepth( sceneDepthSampler, IN.screenProj );
+  half fNoise = 1;
+#if %NOISE  
+  fNoise = saturate(tex3D(noiseMapSampler, IN.noiseTC.xyz).a * 2.h - 0.25h);
+#endif  
+
+
+  float beamDepth = IN.screenProj.w;
+  float depth = ( sceneDepth - beamDepth );
+  half softIntersect = saturate( SoftIntersectionFactor * min(depth, IN.screenProj.w) ) ;
+
+  half fadeBeam = min(softIntersect, saturate( SoftIntersectionFactor * (beamDepth - PerView_NearFarClipDist.x)) );
+
+  IN.Color.w = 1.h;
+  OUT.Color = baseTex * IN.Color * fadeBeam * fNoise;
+
+  return OUT;
+}
+
+// Default technique for beams rendering
+//////////////////////////////// technique ////////////////
+
+technique General
+{
+  pass p0
+  {
+    VertexShader = TemplBeamVS();
+    PixelShader = TemplBeamPS();
+    
+    ZEnable = true;
+    ZWriteEnable = false;
+    CullMode = None;
+
+    SrcBlend = ONE;
+    DestBlend = ONE;
+    AlphaBlendEnable = true;
+  
+    
+  }
+}

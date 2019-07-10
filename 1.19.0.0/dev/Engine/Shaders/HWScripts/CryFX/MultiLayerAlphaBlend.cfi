@@ -1,0 +1,197 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+
+// Derived from dtab.glsl, Copyright nVidia:
+/***************************************************************************
+Copyright (c) 2016, NVIDIA CORPORATION.  All rights reserved.
+***************************************************************************/
+#ifndef MULTI_LAYER_ALPHA_BLEND_INCLUDE
+#define MULTI_LAYER_ALPHA_BLEND_INCLUDE
+
+#define MLAB_MAX_LAYERS (4)
+
+#define MLAB_HAS_DATA       0x1
+#define MLAB_DO_DEPTH_FIXUP 0x2
+
+
+struct MLABPackedLayer
+{
+    float depth;      // Layer depth
+    uint color;       // Layer color RGBM (4 x 8bit),
+    uint trans_flags; // Layer RGB transmittance (3 x 8bit) (8 bits for future use - refraction?)
+    uint pad;         // Future use - motion vectors(2 x 8bit), refraction(2 x 8bit)
+};
+
+struct MLABUnpackedLayer
+{
+    float  depth;
+    float3 color;
+    float3 trans;
+    float2 movec;
+    uint flags;
+};
+
+uint packHalf2x16(half2 value)
+{
+    return (f32tof16(value.x) << 16) | f32tof16(value.y);
+}
+
+float2 unpackHalf2x16(uint value)
+{
+    return float2(f16tof32(value >> 16), f16tof32(value));
+}
+
+uint packUnorm4x8(float4 value)
+{
+    return uint(
+        ((uint)(saturate(value.x) * 255.0f + 0.5)) << 24 |
+        ((uint)(saturate(value.y) * 255.0f + 0.5)) << 16 |
+        ((uint)(saturate(value.z) * 255.0f + 0.5)) << 8 |
+        ((uint)(saturate(value.w) * 255.0f + 0.5))
+    );
+}
+
+uint packUnorm3x8(float3 value)
+{
+    return uint(
+        ((uint)(saturate(value.x) * 255.0f + 0.5)) << 16 |
+        ((uint)(saturate(value.y) * 255.0f + 0.5)) << 8 |
+        ((uint)(saturate(value.z) * 255.0f + 0.5))
+    );
+}
+
+float4 unpackUnorm4x8(uint value)
+{
+    return float4(
+        float(value >> 24) / 255.0,
+        float((value >> 16) & 0xFF) / 255.0,
+        float((value >> 8) & 0xFF) / 255.0,
+        float(value & 0xFF) / 255.0
+    );
+}
+
+float3 unpackUnorm3x8(uint value)
+{
+    return float3(
+        float((value >> 16) & 0xFF) / 255.0,
+        float((value >> 8) & 0xFF) / 255.0,
+        float(value & 0xFF) / 255.0
+    );
+}
+
+void MLABPack(in MLABUnpackedLayer unpacked, out MLABPackedLayer packed)
+{
+    packed.depth  = unpacked.depth;
+    packed.color = packUnorm4x8(RGBMEncode(unpacked.color));
+    packed.trans_flags = (packUnorm3x8(unpacked.trans) << 8) | (unpacked.flags & 0xFF);
+    packed.pad = 0; // packHalf2x16(unpacked.movec);
+}
+
+void MLABUnpack(in MLABPackedLayer packed, out MLABUnpackedLayer unpacked)
+{
+    unpacked.depth = packed.depth;
+
+    float4 rgbm = unpackUnorm4x8(packed.color);
+    unpacked.color = RGBMDecode(rgbm);
+    unpacked.trans = unpackUnorm3x8(packed.trans_flags >> 8);
+    unpacked.flags = packed.trans_flags & 0xFF;
+    unpacked.movec = float2(0.0f, 0.0f); // unpackHalf2x16(packed.payload.g);
+}
+
+int MLABGetAddress(int2 coord, int imageWidth, int numLayers)
+{
+    return numLayers * (coord.x + coord.y * imageWidth);
+}
+
+void MLABInitLayer(in float depth, in float3 color, in float3 trans, in float2 motion, in uint flags, inout MLABPackedLayer packed)
+{
+    MLABUnpackedLayer unpacked = { depth, color, trans, motion, flags };
+    MLABPack(unpacked, packed);
+}
+
+void MLABClearLayer(inout MLABPackedLayer packed)
+{
+    float  depth = 1.0f / 0.0f;              // z = +infinity
+    float3 color = float3(0.0f, 0.0f, 0.0f); // black
+    float3 trans = float3(1.0f, 1.0f, 1.0f); // fully transparent
+    float2 movec = float2(0.0f, 0.0f);       // static
+    uint flags = 0x0;
+
+    MLABInitLayer(depth, color, trans, movec, flags, packed);
+}
+
+void MLABLoad(in RasterizerOrderedStructuredBuffer<MLABPackedLayer> pMLABBuffer, in int2 coord, in int imageWidth, out MLABPackedLayer packed[MLAB_MAX_LAYERS], int numLayers)
+{
+    int address = MLABGetAddress(coord, imageWidth, numLayers);
+    for (int i = 0; i < numLayers && i < MLAB_MAX_LAYERS; i++) {
+        packed[i] = pMLABBuffer[i + address];
+    }
+}
+
+void MLABStore(in RasterizerOrderedStructuredBuffer<MLABPackedLayer> pMLABBuffer, in int2 coord, in int imageWidth, in MLABPackedLayer packed[MLAB_MAX_LAYERS], int numLayers)
+{
+    int address = MLABGetAddress(coord, imageWidth, numLayers);
+    for (int i = 0; i < numLayers && i < MLAB_MAX_LAYERS; i++) {
+        pMLABBuffer[i + address] = packed[i];
+    }
+}
+
+void MLABClear(in RasterizerOrderedStructuredBuffer<MLABPackedLayer> pMLABBuffer, in int2 coord, in int imageWidth, int numLayers)
+{
+    MLABPackedLayer packed;
+    MLABClearLayer(packed);
+    int address = MLABGetAddress(coord, imageWidth, numLayers);
+    for (int i = 0; i < numLayers && i < MLAB_MAX_LAYERS; i++) {
+        pMLABBuffer[address + i] = packed;
+    }
+}
+
+void MLABAddLayer(in MLABPackedLayer one, inout MLABPackedLayer many[MLAB_MAX_LAYERS], int numLayers)
+{
+    // Bubble sort layers
+    for (int i = 0; i < numLayers && i < MLAB_MAX_LAYERS; i++) {
+        if (one.depth < many[i].depth) {
+            MLABPackedLayer temp = many[i];
+            many[i] = one;
+            one = temp;
+        }
+    }
+
+    // Unpack & merge last layer with excess layer
+    MLABUnpackedLayer last, excess;
+    MLABUnpack(many[numLayers - 1], last);
+    MLABUnpack(one, excess);
+
+    last.color = last.color + last.trans * excess.color;
+    last.trans = last.trans * excess.trans;
+    last.flags = last.flags | excess.flags;
+
+    // Update packed last layer
+    MLABPack(last, many[numLayers - 1]);
+}
+
+void MLABInsertLayer(in RasterizerOrderedStructuredBuffer<MLABPackedLayer> pMLABBuffer,
+    in float3 color, in float3 trans, in float depth, in uint flags, in int layerCount, in int2 pixelCoord, in int screenWidth)
+{
+    // Init new layer with current fragment data
+    MLABPackedLayer newLayer;
+    flags |= MLAB_HAS_DATA;
+    MLABInitLayer(depth, color, trans, float2(0.0, 0.0), flags, newLayer);
+
+    MLABPackedLayer layers[MLAB_MAX_LAYERS];
+    MLABLoad(pMLABBuffer, pixelCoord, screenWidth, layers, layerCount);
+    MLABAddLayer(newLayer, layers, layerCount);
+    MLABStore(pMLABBuffer, pixelCoord, screenWidth, layers, layerCount);
+
+}
+
+#endif

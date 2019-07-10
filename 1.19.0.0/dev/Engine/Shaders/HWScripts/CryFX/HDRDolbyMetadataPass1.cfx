@@ -1,0 +1,90 @@
+//--------------------------------------------------------------------------------------------
+//
+// This product contains one or more programs protected under international and 
+// U.S. copyright laws as unpublished works.  They are confidential and proprietary to Dolby Laboratories.  
+// Their reproduction or disclosure, in whole or in part, or the production of derivative works 
+// therefrom without the express permission of Dolby Laboratories is prohibited.  
+// Copyright 2013-2015 by Dolby Laboratories.  All rights reserved.
+//
+//--------------------------------------------------------------------------------------------
+
+
+#define NUM_GROUPS 16
+
+float4 Parameters0; 
+
+#define Elements ((int)Parameters0.x)
+#define Relaxation 0.10
+
+struct OutputData
+{
+	float TotalMin;
+	float TotalMax;
+	float TotalAvg;
+};
+
+RWStructuredBuffer<float> Output : register(u0);
+StructuredBuffer<float4> ReductionInput : register(t0);
+
+OutputData ReduceGroup(uint startX, uint endX)
+{
+	OutputData vout;
+	vout.TotalMin = 10000000000.0;
+	vout.TotalMax = -10000000000.0;
+	vout.TotalAvg = 0.0;
+	for(uint i=startX; i<endX; i++)
+	{
+		float4 min_max_avg = ReductionInput[i];
+		vout.TotalMin = min(vout.TotalMin, min_max_avg.x);
+		vout.TotalMax = max(vout.TotalMax, min_max_avg.y);
+		vout.TotalAvg += min_max_avg.z;
+	}
+	return vout;
+}
+
+OutputData CombineGroup(OutputData a, OutputData b)
+{
+	OutputData ret;
+	ret.TotalMin = min(a.TotalMin, b.TotalMin);
+	ret.TotalMax = max(a.TotalMax, b.TotalMax);
+	ret.TotalAvg = (a.TotalAvg + b.TotalAvg);
+	return ret;
+}
+
+groupshared OutputData GroupOutput[NUM_GROUPS];
+
+[numthreads(NUM_GROUPS, 1, 1)]									
+void CS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,		
+    uint3 GroupThreadId : SV_GroupThreadID,				
+	uint GroupIndex: SV_GroupIndex) 					
+{
+	uint Count = Elements/NUM_GROUPS;
+	GroupOutput[GroupIndex]=ReduceGroup(GroupIndex*Count,(GroupIndex==NUM_GROUPS-1)?Elements:(GroupIndex*Count+Count));
+	GroupMemoryBarrierWithGroupSync();
+	
+	if(GroupIndex == 0)
+	{
+		OutputData od = GroupOutput[0];
+		[unroll] for(int i=1; i<NUM_GROUPS; i++)
+			od = CombineGroup(od, GroupOutput[i]);
+
+		float3 CurrentValue = float3(Output[0], Output[1], Output[2]);
+		float3 NewValue = float3(od.TotalMin, od.TotalMax, od.TotalAvg / ((float)Elements));
+		NewValue = CurrentValue + (NewValue - CurrentValue) * Relaxation;
+		Output[0] = NewValue.x;	
+		Output[1] = NewValue.y;	
+		Output[2] = NewValue.z;
+	}
+}
+
+// Default technique
+technique Default
+{
+  pass p0
+  {
+    ComputeShader = CS();
+  }
+}
+

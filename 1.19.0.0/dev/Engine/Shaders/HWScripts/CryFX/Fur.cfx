@@ -1,0 +1,866 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+
+/*
+* Thanks to the following prior work in fur rendering techniques:
+*   "Real-Time Fur over Arbitrary Surfaces" by J. Lengyel et al., published in I3D '01 Proceedings of the 2001 symposium on Interactive 3D Graphics
+*   "Implementing Fur Using Deferred Shading" by D. Revie, published in GPU Pro 2
+*/
+
+/*
+* This file is primarily responsible for the forward shell passes, but also contains
+* the logic for vertex extrusion/bending and helper functions used by other fur passes.
+*/
+
+// Validate mutually exclusive flags aren't both set
+#if %FUR_BLENDLAYER
+    #if %FUR_BLENDCOLOR
+        #undefine %FUR_BLENDCOLOR
+    #endif
+#endif
+
+#include "Common.cfi"
+#include "ShadowCommon.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+    string Script =
+        "Public;"
+        "SupportsDeferredShading;"
+        #if %FUR_WIND_BENDING
+            "VT_WindBending;"
+        #endif
+        #if %FUR_VERT_COLORS
+            "VertexColors;"
+        #endif
+        #if %DEPTH_FIXUP
+            "DepthFixup;"
+        #endif
+        "ShaderDrawType = Fur;"
+        "ShaderType = General;"
+>;
+
+//////////////////////////////////////////////////////////////////////////////////////
+// Render flags used uniquely by this shader:
+// %_RT_DEBUG[0-3]               - controlled via r_FurDebug to display various debug info
+// %_RT_GPU_PARTICLE_TURBULENCE  - indicates fin pass (either forward shading or shadow)
+// %_RT_GPU_PARTICLE_SHADOW_PASS - do not draw fins in shadow pass (set when r_FurFinShadowPass = 0)
+//////////////////////////////////////////////////////////////////////////////////////
+
+// Shared structure used by shell/fin pixel shaders, as well as being provided to frag_shared_output for aux window rendering 
+struct fragPassCustom
+{
+    float4 vBaseScreen;  // Screen proj coords corresponding to the base of the fur for this strand
+    float4 vTipScreen;   // Screen proj coords corresponding to the tip of the fur for this strand
+    float4 vFurData;     // xyz contains motion delta, for debugging. w contains scaled fur length
+    half albedoAtten;    // Attenuation value used for blending albedo, in range [0, 1]
+    half alpha;          // Alpha to apply for this fragment. Fades out according to fur heightmap
+};
+
+struct fragLightPassCustom
+{
+};
+
+#include "ShadeLib.cfi"
+
+sampler2D furHeightmapSampler
+{
+    string UIName = "Fur Heightmap";
+    string UIDescription = "Repeating patch to add variety to fur length across mesh";
+    Texture = $CustomMap;
+    MinFilter = LINEAR;
+    MagFilter = LINEAR;
+    MipFilter = POINT;
+    AddressU = Wrap;
+    AddressV = Wrap;
+};
+
+#if %FUR_BLENDLAYER
+sampler2D furSelfShadowSampler
+{
+    string UIName = "Fur Self Shadowing Map";
+    string UIDescription = "Diffuse map for the base of the fur, interpolated with the primary diffuse map as fur extends outward.";
+    Texture = $CustomSecondaryMap;
+    sRGBLookup = false;
+};
+#elif %FUR_BLENDCOLOR
+float4 FurSelfShadowColor
+<
+    register = PER_MATERIAL_4;
+    string UIWidget = "color";
+    string UIName = "Fur Self Shadowing Color";
+    string UIDescription = "Color to blend toward as fur gets closer to the base surface.";
+> = {0.1, 0.1, 0.1, 1.0};
+#endif
+
+#if %FUR_BLENDLAYER || %FUR_BLENDCOLOR
+half FurSelfShadowBias
+<
+    register = PER_MATERIAL_0.y;
+    string UIWidget = "slider";
+    string UIName = "Fur Self Shadowing Bias";
+    string UIDescription = "Bias used to control how fur darkens as it gets closer to the base surface.";
+    float UIMin = 0.0;
+    float UIMax = 5.0;
+    float UIStep = 0.01;
+> = 1.0;
+#endif
+
+half FurLengthCM
+<
+    register = PER_MATERIAL_1.x;
+    string UIWidget = "slider";
+    string UIName = "Fur Length (cm)";
+    string UIDescription = "Maximum fur length in centimeters, can be scaled per vertex from mesh.";
+    float UIMin = 0.0;
+    float UIMax = 100.0;
+    float UIStep = 0.1;
+> = 10.0;
+
+half FurMaxGravity
+<
+    register = PER_MATERIAL_1.y;
+    string UIWidget = "slider";
+    string UIName = "Fur Maximum Gravity";
+    string UIDescription = "Maximum gravity applied to fur, further controlled by stiffness.";
+    float UIMin = 0.0;
+    float UIMax = 5.0;
+    float UIStep = 0.01;
+> = 2.0;
+
+half FurStiffness
+<
+    register = PER_MATERIAL_1.z;
+    string UIWidget = "slider";
+    string UIName = "Fur Stiffness";
+    string UIDescription = "Stiffness of fur for effects such as wind bending and gravity.";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.001;
+> = 1.0;
+
+half FurFinAlphaTest
+<
+    register = PER_MATERIAL_3.w;
+    string UIWidget = "slider";
+    string UIName = "Fur Fins Alpha Test";
+    string UIDescription = "Alpha test value to use for controlling visibility of fur in fin passes.";
+    float UIMin = 0.0;
+    float UIMax = 1;
+    float UIStep = 0.001;
+> = 0.5;
+
+half SSSStrength
+<
+    register = PER_MATERIAL_3.y;
+    string UIWidget = "slider";
+    string UIName = "SSS Strength";
+    string UIDescription = "Glow strength of subsurface scattering.";
+    float UIMin = 0.0;
+    float UIMax = 5.0;
+    float UIStep = 0.001;
+> = 1.0;
+
+half SSSFalloff
+<
+    register = PER_MATERIAL_3.z;
+    string UIWidget = "slider";
+    string UIName = "SSS Falloff";
+    string UIDescription = "Glow falloff of subsurface scattering.";
+    float UIMin = 0.0;
+    float UIMax = 5.0;
+    float UIStep = 0.001;
+> = 1.0;
+
+#if %FUR_VERT_COLORS
+half FurBaseIntrusion
+<
+    register = PER_MATERIAL_1.w;
+    string UIWidget = "slider";
+    string UIName = "Fur Base Intrusion";
+    string UIDescription = "Percentage of scaled fur length per-vertex to intrude base surface.";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.001;
+> = 0.0;
+
+half FurCombBias
+<
+    register = PER_MATERIAL_0.w;
+    string UIWidget = "slider";
+    string UIName = "Fur Combing Bias";
+    string UIDescription = "Bias used to control how quickly the fur bends from normal to comb direction.";
+    float UIMin = 0.0;
+    float UIMax = 5.0;
+    float UIStep = 0.01;
+> = 1.0;
+#endif
+
+// FurParams:
+//   x, y, z - wind direction and strength in world space
+//   w - scale for fur length to dictate extrusion distance for shell pass
+float4 FurParams : PI_FurParams;
+
+float3x4 PrevObjWorldMatr : PI_PrevObjWorldMatrix;
+
+// FurLODInfo:
+//   x - Current object's first LOD distance
+//   y - Current object's max view distance
+//   z, w - unused
+float4 FurLODInfo : PI_FurLODInfo;
+
+struct streamPosCustom
+{
+    bool bPrevPass;
+    bool bMotionBending; // Indicates that prev frame bending should be applied
+    float shellDistance;
+#if %FUR_VERT_COLORS
+    float3 vFurCombWorld;
+    float furLengthScale;
+#endif
+#if %_RT_GPU_PARTICLE_TURBULENCE
+    float3 vNormal;
+#endif
+    float3 vWorldPosPrev;
+    float4 vBaseWorld; // Base fur strand position in world space
+    float4 vTipWorld;  // Tip (outermost shell) fur strand position in world space
+};
+
+half GetFurLengthMeters()
+{
+    return FurLengthCM * 0.01;
+}
+
+#if %FUR_WIND_BENDING
+float WindFrequency
+<
+    register = PER_MATERIAL_2.x;
+    string UIName = "Wind Frequency";
+    string UIHelp = "Set wind frequency";
+
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 10.0;
+    float UIStep = 0.001;
+> = 1.0;
+
+float WindPhase
+<
+    register = PER_MATERIAL_2.y;
+    string UIName = "Wind Phase";
+    string UIHelp = "Set wind phase";
+
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 10.0;
+    float UIStep = 0.001;
+> = 1.0;
+
+float WindScale
+<
+    register = PER_MATERIAL_2.z;
+    string UIName = "Wind Scale";
+    string UIHelp = "Set wind scale";
+
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.001;
+> = 1.0;
+
+float3 FurShellWind(float4 vPosWorld, float3 vNormWorld, float stiffness)
+{
+    if (any(FurParams.xyz) && FurStiffness < 1.0)
+    {
+        float3 vWindWorld = FurParams.xyz;
+        float windSpeed = length(vWindWorld);
+
+        // Very high wind speed adversely impacts the effect, cap it to 10 (chosen empirically)
+        const float c_maxWindSpeed = 10; 
+        vWindWorld = normalize(vWindWorld) * clamp(windSpeed * WindScale, 0.001, c_maxWindSpeed);
+
+        // Apply stiffness
+        vWindWorld *= stiffness;
+        float nDotWind = dot(vNormWorld, vWindWorld);
+
+        // Compute rejection of W on N: W - N * (W dot N) / (N dot N)
+        // N is unit length so N dot N can be omitted
+        float3 windProj = vWindWorld - nDotWind * vNormWorld;
+
+#if %_RT_GPU_PARTICLE_TURBULENCE
+        // For fin passes, restrict bending to the plane orthogonal to the view
+        float3 vView = normalize(vPosWorld.xyz - PerShadow_LightPos.xyz);
+        float viewDotWind = dot(vView, windProj);
+        windProj = vWindWorld - viewDotWind * vView;
+#endif
+
+        // windProj is the most that we will bend. Now apply the wind with phase/amplitude.
+        // This is mostly the same wind bending as pos_wind_General, but with amplitude dictated by windProj
+        float windAmplitude0 = length(windProj);
+        float windAmplitude2 = windAmplitude0 * 0.2;
+        float windAmplitude1 = (windAmplitude0 + windAmplitude2) * 0.5;
+        float4 vWavesAmp = float4(windAmplitude0 * 0.573, windAmplitude0, windAmplitude1, windAmplitude2);
+        const float4 vWavesPhases = float4(0.5 + 0.3799, 0.5 + 0.575, 0.5 + 0.795, 0.5 + 1.099);
+
+        // Set phase in opposite direction of wind, this makes the waves moving across the fur flow in the wind direction
+        float fAnimPhase = dot(vPosWorld.xyz, WindPhase * normalize(-FurParams.xyz));
+        float fSpeed = WindFrequency;
+
+        float4 vWaves = (frac((PerView_AnimGenParams.z + fAnimPhase) * vWavesPhases) * 2.0 - 1.0) * fSpeed;
+        vWaves = abs(frac(vWaves + 0.5) * 2.0 - 1.0);
+
+        float fWaveSum = dot(vWavesAmp, vWaves);
+
+        // Apply the phased wind vector by adding it to the normal
+        float3 windBend = vNormWorld + windProj * fWaveSum;
+
+        return normalize(windBend);
+    }
+    else
+    {
+        return vNormWorld;
+    }
+}
+#endif
+
+void ComputeFurCombing(inout float3 vFurComb, float4x4 InstMatrix)
+{
+#if %FUR_VERT_COLORS
+    vFurComb.xyz = 2 * vFurComb.zyx - 1.0;
+    vFurComb.x = -vFurComb.x;
+
+    #if !%MODEL_SPACE_Z_UP
+        // Reorient combing direction if Y up was used for the model
+        vFurComb.xyz = float3(-1, 1, 1) * vFurComb.xzy;
+    #endif
+
+    if (any(vFurComb))
+    {
+        vFurComb = mul(InstMatrix, float4(normalize(vFurComb), 0)).xyz;
+        vFurComb = normalize(vFurComb);
+    }
+#endif
+}
+
+float3 ApplyProjectedGravity(float3 vNormal, half stiffness)
+{
+    float3 vGravityWorld = float3(0, 0, stiffness * -FurMaxGravity);
+
+    float nDotGrav = dot(vNormal, vGravityWorld);
+
+    // Compute rejection of G on N: W - N * (G dot N) / (N dot N)
+    // N is unit length so N dot N can be omitted
+    float3 gravProj = vGravityWorld - nDotGrav * vNormal;
+
+    vNormal = normalize(vNormal + gravProj);
+    return vNormal;
+}
+
+float3 RestrictFurCombing(float3 vNormal, float3 vFurCombWorld)
+{
+    // Restrict fur combing to the hemisphere pointing in the normal direction
+    float nDotComb = dot(vNormal, vFurCombWorld);
+    if (nDotComb < 0)
+    {
+        // Performing the vector triple product (vNormal x vFurCombWorld) x vNormal
+        // since vNormal is unit length, simplified using the property A x (B x C) = B(A dot C) - C(A dot B)
+        float3 vOrthoN = mad(vNormal, -nDotComb, vFurCombWorld);
+        vFurCombWorld = normalize(vOrthoN);
+    }
+    return normalize(vFurCombWorld + vNormal);
+}
+
+void CustomModificator(inout float4 vPosWorld, float3 vNormWorld, float4x4 InstMatrix, inout streamPosCustom customData)
+{
+    half furLength = GetFurLengthMeters();
+    float4 vFurLength = float4(furLength, furLength, furLength, 0);
+#if %FUR_LENGTH_SCALED
+    // Factor object scale into fur length
+    const float3x3 trWrlMat = transpose(InstMatrix);
+    vFurLength.xyz *= float3(length(trWrlMat[0]), length(trWrlMat[1]), length(trWrlMat[2]));
+#endif
+
+#if %FUR_VERT_COLORS
+    // Intrude base fur position by a percentage of fur length
+    vPosWorld.xyz -= vNormWorld * FurBaseIntrusion * customData.furLengthScale * vFurLength;
+#endif
+
+#if !%_RT_GPU_PARTICLE_TURBULENCE
+    if (customData.bPrevPass || customData.shellDistance == 0.0f)
+    {
+        return;
+    }
+#endif
+
+    // Stiffness attenuation is quadratic so that the fur tips can bend a lot while the roots move less
+    half tipStiffness = (1.0 - FurStiffness);
+    tipStiffness *= tipStiffness;
+    half currentStiffness = tipStiffness;
+#if !%_RT_GPU_PARTICLE_TURBULENCE // Do not attenuate stiffness by shell in fin passes, so base position and bent normal are returned
+    currentStiffness *= customData.shellDistance;
+#endif
+
+    float3 vCurrentNormal = vNormWorld;
+    float3 vTipNormal = vNormWorld;
+
+#if !%_RT_GPU_PARTICLE_TURBULENCE
+    if (customData.bMotionBending)
+    {
+        // Apply movement bending from previous frame
+        customData.vWorldPosPrev = customData.vWorldPosPrev - vPosWorld;
+        vCurrentNormal += customData.vWorldPosPrev * currentStiffness;
+        vCurrentNormal = normalize(vCurrentNormal);
+
+        vTipNormal += customData.vWorldPosPrev * tipStiffness;
+        vTipNormal = normalize(vTipNormal);
+    }
+    else
+    {
+        customData.vWorldPosPrev = float3(0, 0, 0);
+    }
+#endif
+
+#if %FUR_WIND_BENDING
+    // Apply wind bending
+    vCurrentNormal = FurShellWind(vPosWorld, vCurrentNormal, currentStiffness);
+    vTipNormal = FurShellWind(vPosWorld, vTipNormal, tipStiffness);
+#endif
+
+    if (FurStiffness < 1.0 && FurMaxGravity > 0.0)
+    {
+        // Apply gravity for this shell
+        vCurrentNormal = ApplyProjectedGravity(vCurrentNormal, currentStiffness);
+        vTipNormal = ApplyProjectedGravity(vTipNormal, tipStiffness);
+    }
+
+#if %FUR_VERT_COLORS
+    ComputeFurCombing(customData.vFurCombWorld, InstMatrix);
+
+    float3 vCurrentNormalBent = RestrictFurCombing(vCurrentNormal, customData.vFurCombWorld);
+    vTipNormal = RestrictFurCombing(vTipNormal, customData.vFurCombWorld);
+
+    float3 vOffset = lerp(vCurrentNormalBent, vCurrentNormal, 1 - pow(customData.shellDistance, FurCombBias));
+    vOffset *= vFurLength.xyz * customData.furLengthScale * customData.shellDistance;
+    float3 vTipOffset = vTipNormal * vFurLength.xyz * customData.furLengthScale;
+#else
+    float3 vOffset = vCurrentNormal.xyz * vFurLength.xyz * customData.shellDistance;
+    float3 vTipOffset = vTipNormal.xyz * vFurLength.xyz; // Tip is at shellDistance = 1
+#endif
+
+#if %_RT_GPU_PARTICLE_TURBULENCE
+    customData.vNormal = vCurrentNormal;
+#endif
+
+    customData.vBaseWorld = vPosWorld;
+    customData.vTipWorld = vPosWorld + float4(vTipOffset, 0);
+
+    vPosWorld.xyz += vOffset;
+}
+
+#include "VertexLib.cfi"
+
+struct vert2FragShell
+{
+    vert2FragGeneral General;
+    float4 vBaseScreen : TEXCOORDN; // Base fur strand position in screen proj coords
+    float4 vTipScreen : TEXCOORDN; // Tip (outermost shell) fur strand position in screen proj coords
+    float4 vFurData : TEXCOORDN; // xyz is vertex frame movement; w is scaled fur length
+};
+
+vert2FragShell FurShellVS(app2vertGeneral IN)
+{
+    streamPos vertPassPos = (streamPos)0;
+    vertPassPos.CustomData.bPrevPass = true;
+    vertPassPos.CustomData.shellDistance = FurParams.w;
+    #if %FUR_VERT_COLORS
+        vertPassPos.CustomData.vFurCombWorld = IN.vertCommon.Color.xyz;
+        vertPassPos.CustomData.furLengthScale = IN.vertCommon.Color.w;
+    #endif
+
+    streamPos_FromGeneral(IN, vertPassPos);
+    {
+        float4x4 matInstPrev;
+        matInstPrev[0] = PrevObjWorldMatr[0];
+        matInstPrev[1] = PrevObjWorldMatr[1];
+        matInstPrev[2] = PrevObjWorldMatr[2];
+        matInstPrev[3] = float4(0, 0, 0, 1);
+
+        // Set relative to camera to match what current frame world pos will do
+        matInstPrev[0][3] -= PerView_WorldViewPos.x;
+        matInstPrev[1][3] -= PerView_WorldViewPos.y;
+        matInstPrev[2][3] -= PerView_WorldViewPos.z;
+
+        vertPassPos.InstMatrix = matInstPrev;
+        float4 HPositionPrev = _pos_Modificators(PerView_ViewProjZeroMatr, vertPassPos.InstMatrix, vertPassPos, false, true, 1.f);
+        vertPassPos.CustomData.vWorldPosPrev = vertPassPos.WorldPosPrev;
+        vertPassPos.CustomData.bPrevPass = false;
+        vertPassPos.CustomData.bMotionBending = true;
+    }
+
+    vert2FragShell OUT = (vert2FragShell)0;
+    vs_shared_output(IN, OUT.General, vertPassPos, true);
+
+    // Output base/tip screen space coords and depth
+    float4 HPos = mul(PerView_ViewProjZeroMatr, vertPassPos.CustomData.vBaseWorld);
+    OUT.vBaseScreen = HPosToScreenTC(HPos);
+
+    HPos = mul(PerView_ViewProjZeroMatr, vertPassPos.CustomData.vTipWorld);
+    OUT.vTipScreen = HPosToScreenTC(HPos);
+
+    OUT.vFurData.xyz = vertPassPos.CustomData.vWorldPosPrev;
+    OUT.vFurData.w = FurParams.w * GetFurLengthMeters();
+    #if %FUR_VERT_COLORS
+        OUT.vFurData.w *= IN.vertCommon.Color.w;
+    #endif
+
+    return OUT;
+}
+
+sampler2D furPrepassSampler = sampler_state
+{
+    Texture = $FurPrepass;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = POINT;
+    AddressU = Border;
+    AddressV = Border;
+    BorderColor = {0, 0, 0, 1};
+};
+
+// Returns albedo color of the fur, accounting for albedo attenuation, blend color/blend layer, and material diffuse color
+half4 GetFurAlbedo(float2 tc, half albedoAttenuation, float depth, bool applySelfShadowing, bool bApplyMaterialDiffuse)
+{
+    half4 albedo = tex2D(diffuseMapSampler, tc);
+
+    if (applySelfShadowing)
+    {
+#if %FUR_BLENDLAYER || %FUR_BLENDCOLOR
+        // Apply self shadow bias value from material
+        half lerpVal = pow(albedoAttenuation, FurSelfShadowBias);
+
+        // To avoid incorrectly dark fur at distance (with shell count impacted by LOD), lerp by view distance
+        // For the majority of cases of view distance and LOD ratio, this heuristic produces good results.
+        // It may produce too dark or too bright results for unusual combinations of those settings.
+        const float firstFurLodDistance = FurLODInfo.x;
+        const float maxFurLodDistance = FurLODInfo.y;
+        lerpVal = lerp(lerpVal, 1.0, smoothstep(firstFurLodDistance, maxFurLodDistance, depth));
+
+        // Scale by shell distance so that shells closer to base maintain self-shadowing for slightly longer.
+        // 0.5 chosen empirically so that closer shells preserve some value but for outer shells this is no-op.
+        const float c_shellPercentOffset = 0.5;
+        lerpVal *= saturate(FurParams.w + c_shellPercentOffset);
+#endif // %FUR_BLENDLAYER || %FUR_BLENDCOLOR
+
+#if %FUR_BLENDLAYER
+        albedo.rgb = lerp(tex2D(furSelfShadowSampler, tc).rgb, albedo.rgb, lerpVal);
+#elif %FUR_BLENDCOLOR
+        albedo.rgb = lerp(FurSelfShadowColor.rgb, albedo.rgb, lerpVal);
+#endif // %FUR_BLENDCOLOR
+    }
+
+    if (bApplyMaterialDiffuse)
+    {
+        albedo.rgb *= PerMaterial_DiffuseColor.rgb;
+    }
+    return albedo;
+}
+
+// Functions required by frag_shared_output - these are only used for aux window rendering
+void frag_unify_parameters(inout fragPass pPass)
+{
+}
+
+void frag_custom_begin(inout fragPass pPass)
+{
+    float4 baseTC = pPass.IN.baseTC;
+
+    // Diffuse component
+    const float furEpsilon = 0.001f;
+    const bool  applyFurSelfShadow = (pPass.pCustom.vFurData.w > furEpsilon);  // do not self shadow if not within fur area
+    pPass.cDiffuseMap.rgb = GetFurAlbedo(baseTC.xy, pPass.pCustom.albedoAtten, pPass.IN.screenProj.w, applyFurSelfShadow, true).rgb;
+
+    // Specular component
+    #if %SPECULAR_MAP
+        pPass.cSpecularMap = GetTexture2D(specularMapSampler, baseTC.xy);
+    #endif
+    pPass.cSpecularMap *= PerMaterial_SpecularColor;
+
+    pPass.fGloss *= GetTexture2D(smoothnessMapSampler, baseTC.xy).r;
+
+    // Output alpha
+    half fAlpha = pPass.pCustom.alpha;
+}
+
+void frag_custom_per_light(inout fragPass pPass, inout fragLightPass pLight)
+{
+    // This lighting path is only used for aux view such as the material editor preview, so this path does not calculate anisotropic spec
+    // Mimicking the hair shader's anistropic spec here would still not match how fur calculates it in the main viewport
+
+    pLight.fNdotL = saturate(pLight.fNdotL);
+    
+    half fRoughness = SmoothnessToRoughness(pPass.fGloss, MIN_ROUGHNESS);
+    half3 cDiffuse = pLight.cDiffuse.xyz * DiffuseBRDF(fRoughness, pPass.vNormal.xyz, pPass.vView, pLight.vLight, pLight.fNdotL);
+    half3 cSpecular = pLight.cSpecular.xyz * SpecularBRDF(fRoughness, pPass.vNormal, pPass.vView, pLight.vLight, pPass.cSpecularMap.rgb, 1.0) * pLight.fNdotL;
+
+    half3 cK = pLight.fOcclShadow * pLight.fFallOff * pLight.cFilter;
+
+    pPass.cDiffuseAcc.xyz += cDiffuse.xyz * cK.xyz;
+    pPass.cSpecularAcc.xyz += cSpecular.xyz * cK.xyz;
+}
+
+void frag_custom_ambient(inout fragPass pPass, inout half3 cAmbient)
+{
+    pPass.cAmbientAcc.xyz += cAmbient.xyz;
+}
+
+void frag_custom_end(inout fragPass pPass, inout half3 cFinal)
+{
+}
+
+#include "fragLib.cfi"
+
+float4 EncodeFurShellLighting(float3 diffuseAcc, float3 specularAcc, float sceneDepth)
+{
+    uint3 diffuseScaled = f32tof16(diffuseAcc);
+    uint3 specularScaled = f32tof16(specularAcc);
+    uint3 combined = (diffuseScaled << 16) | specularScaled;
+    half3 packedLighting = asfloat(combined);
+    return half4(packedLighting, sceneDepth);
+}
+
+void DecodeFurShellLighting(float4 packedLighting, inout float3 diffuseAcc, inout float3 specularAcc, inout float sceneDepth)
+{
+    uint3 combined = asuint(packedLighting.rgb);
+    diffuseAcc = f16tof32(combined >> 16);
+    specularAcc = f16tof32(combined & 0x0000ffff);
+
+    // When encoding, depth is a passthrough directly from depth buffer. When decoding, translate to linear depth
+    sceneDepth = packedLighting.a * PerView_NearFarClipDist.y;
+}
+
+// Returns 0 if the depth test passes, 1 if it fails
+half FurSampleDepthTest(float bufferDepth, float sampleDepth)
+{
+    return step(0.01, abs(bufferDepth - sampleDepth));
+}
+
+#if %_RT_MULTI_LAYER_ALPHA_BLEND && %FUR_MULTI_LAYER_ALPHA_BLEND	// conditioned both on material and OIT engine enable flags
+    #include "MultiLayerAlphaBlend.cfi"
+    RasterizerOrderedStructuredBuffer<MLABPackedLayer> MultiLayerAlphaBlendBuffer : register(u5); // per-layer pixel data for alpha
+#endif
+
+pixout FurPSInternal(vert2FragGeneral IN, fragPassCustom pFurPass)
+{
+    pixout OUT = (pixout)0;
+
+#if %_RT_HDR_MODE // Main viewport rendering
+    float4 baseData = tex2D(furPrepassSampler, pFurPass.vBaseScreen.xy);
+    float3 baseDiffuse = float3(0, 0, 0), baseSpec = float3(0, 0, 0);
+    float baseDepth = 0;
+    DecodeFurShellLighting(baseData, baseDiffuse, baseSpec, baseDepth);
+
+    float4 tipData = tex2D(furPrepassSampler, pFurPass.vTipScreen.xy);
+    float3 tipDiffuse = float3(0, 0, 0), tipSpec = float3(0, 0, 0);
+    float tipDepth = 0;
+    DecodeFurShellLighting(tipData, tipDiffuse, tipSpec, tipDepth);
+
+    // Select whether we use the base or tip sample, based on validity of depth values and luminance
+
+    // Force lerpVal to 0 if base TC is offscreen
+    float2 baseTC = pFurPass.vBaseScreen.xy;
+    float2 baseTCOffscreen = baseTC - saturate(baseTC);
+    half lerpVal = 1 - abs(sign(baseTCOffscreen.x + baseTCOffscreen.y));
+
+    // Also if base depth is incorrect
+    half baseDepthFail = FurSampleDepthTest(baseDepth, pFurPass.vBaseScreen.w);
+    lerpVal *= (1 - baseDepthFail);
+
+    // Select sample with higher diffuse luminance
+    half baseSum = GetLuminance(baseDiffuse);
+    half tipSum = GetLuminance(tipDiffuse);
+    lerpVal *= saturate(sign(baseSum - tipSum));
+    
+    // Force lerpVal to 1 if tip TC is offscreen
+    float2 tipTC = pFurPass.vTipScreen.xy;
+    float2 tipTCOffscreen = tipTC - saturate(tipTC);
+    lerpVal = saturate(lerpVal + abs(sign(tipTCOffscreen.x + tipTCOffscreen.y)));
+
+    // Also if tip depth is incorrect
+    half tipDepthFail = FurSampleDepthTest(tipDepth, pFurPass.vTipScreen.w);
+    lerpVal = saturate(lerpVal + tipDepthFail);
+
+    lerpVal = 1 - lerpVal;
+
+    const float furEpsilon = 0.001f;
+    const bool  applyFurSelfShadow = (pFurPass.vFurData.w > furEpsilon);  // do not self shadow if not within fur area
+
+    half4 albedo = GetFurAlbedo(IN.baseTC.xy, pFurPass.albedoAtten, IN.screenProj.w, applyFurSelfShadow, true);
+    half4 cFinal = float4(lerp(baseDiffuse, tipDiffuse, lerpVal) * albedo.rgb + lerp(baseSpec, tipSpec, lerpVal), 1);
+
+    #if %_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 1
+        // base/tip sample validity (red = base valid; green = tip valid; yellow = both valid)
+        cFinal = half4(1 - baseDepthFail, 1 - tipDepthFail, 0, 1);
+    #elif !%_RT_DEBUG0 && %_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 2
+        // base/tip selection (red = base chosen; green = tip chosen)
+        cFinal = half4(1 - lerpVal, lerpVal, 0, 1);
+    #elif %_RT_DEBUG0 && %_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 3
+        // show offscreen UVs for base deferred sample (gray = onscreen)
+        cFinal = half4(0.5, 0.5, 0.5, 1);
+        float2 baseUV = pFurPass.vBaseScreen.xy;
+        cFinal.rg = (baseUV.xy == saturate(baseUV.xy)) * 0.5 + (baseUV.xy > 1);
+    #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 4
+        // show offscreen UVs for tip deferred sample (gray = onscreen)
+        cFinal = half4(0.5, 0.5, 0.5, 1);
+        float2 tipUV = pFurPass.vTipScreen.xy;
+        cFinal.rg = (tipUV.xy == saturate(tipUV.xy)) * 0.5 + (tipUV.xy > 1);
+    #elif %_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 5
+        // show final lighting with all base lighting selected
+        cFinal = half4(baseDiffuse * albedo + baseSpec, pFurPass.alpha);
+    #elif !%_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 6
+        // show final lighting with all tip lighting selected
+        cFinal = half4(tipDiffuse * albedo + tipSpec, pFurPass.alpha);
+    #elif %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 7
+        // Visualize fur length scaling
+        cFinal = half4(pFurPass.vFurData.www / (FurParams.w * GetFurLengthMeters()), 1);
+    #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && %_RT_DEBUG3 // r_FurDebug = 8
+        // Fur animation bending velocity
+        cFinal = half4(0.5 + 0.5 * pFurPass.vFurData.xyz, 1);
+    #endif
+
+    #if !%_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // r_FurDebug = 0
+        // Set alpha to match how far away from base surface we are
+        cFinal.a = pFurPass.alpha;
+    #endif
+
+    // Apply global non-volumetric fog with the same logic as in Global Fog Pass (FogPassPS)
+    #if %_RT_FOG && !%_RT_DECAL_TEXGEN_2D && !%_RT_VOLUMETRIC_FOG
+        float3 cameraToWorldPos = IN.vView.xyz;
+        float3 worldPos = PerView_WorldViewPos.xyz + cameraToWorldPos;
+        float4 fogColor = GetVolumetricFogColor(worldPos, cameraToWorldPos);
+        cFinal.xyz = lerp(fogColor.xyz, cFinal.xyz, fogColor.w);
+    #endif
+#else
+    // Aux viewport rendering, such as material editor preview
+    fragPass pPass = (fragPass)0;
+    frag_unify(pPass, IN);
+    pPass.pCustom = pFurPass;
+    half4 cFinal = frag_shared_output(pPass);
+    cFinal.a = pFurPass.alpha;
+#endif
+    
+    #if %_RT_MULTI_LAYER_ALPHA_BLEND && %FUR_MULTI_LAYER_ALPHA_BLEND	// conditioned both on material and OIT engine enable flags
+        float depth = GetScreenCoords(IN.WPos).w;
+        float transmittance = 1.0f - cFinal.a;
+        cFinal.xyz *= cFinal.a;
+
+        // Retrieve depth from opaque linear depth buffer and clip it if should not render
+        // due to opaque object
+        float   sceneDepth = DecodeSceneDepth(sceneDepthSampler, IN.screenProj);
+        clip(sceneDepth - depth);
+
+        uint flags = 0;
+        #if %DEPTH_FIXUP
+            flags |= transmittance < 1.0f - DepthFixupThreshold ? MLAB_DO_DEPTH_FIXUP : 0;
+        #endif
+        MLABInsertLayer(MultiLayerAlphaBlendBuffer, cFinal.xyz, transmittance.xxx, depth, flags, PerFrame_MultiLayerAlphaBlendData.x, int2(IN.WPos.xy), int(PS_ScreenSize.x));
+    #else
+        HDROutput(OUT, cFinal, 1);
+        DepthFixupOutput(OUT.Color, cFinal.a, IN.WPos);
+    #endif //END %FUR_MULTI_LAYER_ALPHA_BLEND
+
+    return OUT;
+}
+
+// Returns the percentage toward the fade out point of this fur strand according to the fur heightmap
+half ComputeFurStrandPercent(sampler2D furHeightmap, float4 tc, float furDistanceToBase)
+{
+    tc = mul(tc, _TCMMatrixDiffuse2); // Apply texture UV matrix for tiling, etc.
+    half furHeight = max(0.01, GetTexture2D(furHeightmap, tc.xy).r);
+    return smoothstep(0.0, furHeight, furDistanceToBase);
+}
+
+// Ensures that base fur sample is not on a stippled outer shell pixel
+float4 AdjustFurBaseSampleTC(float4 baseScreenTC)
+{
+    // If base is on a stippled pixel, move it one texel to the right
+    float4 tc = baseScreenTC;
+    float2 pixelCoord = GetScreenCoordsFromProj(tc); // Convert to pixel center coords
+    pixelCoord = floor(pixelCoord); // Drop pixel center offset
+    float2 offset = float2(1 - any(frac(pixelCoord * 0.5f)), 0); // Offset if pixelCoord.xy are both even
+    tc.xy = (pixelCoord + offset + 0.5) / PS_ScreenSize.xy; // Apply offset and convert back to screen TC
+    return tc;
+}
+
+// Ensures that tip fur sample is on a stippled outer shell pixel (top-left of a 2x2 pixel area)
+float4 AdjustFurTipSampleTC(float4 tipScreenTC)
+{
+    // If tip is not on a stippled pixel, move it one texel up and/or left
+    float4 tc = tipScreenTC;
+    float2 pixelCoord = GetScreenCoordsFromProj(tc); // Convert to pixel center coords
+    pixelCoord -= frac(pixelCoord * 0.5f) * 2.0f; // Halve coord, take remainder, rescale to full res to clamp to stippled pixels
+    tc.xy = (pixelCoord + 0.5) / PS_ScreenSize.xy; // Convert back to screen TC
+    return tc;
+}
+
+pixout FurShellPS(vert2FragShell IN)
+{
+#if %_RT_HDR_MODE // Main viewport rendering
+    // Discard fragments that are too close to the base surface which cause stippled artifacts
+    clip(IN.vFurData.w - 0.001);
+#endif
+
+    fragPassCustom pFurPass = (fragPassCustom)0;
+    pFurPass.vFurData = IN.vFurData;
+
+    half strandPercent = ComputeFurStrandPercent(furHeightmapSampler, IN.General.baseTC, FurParams.w);
+    pFurPass.alpha = 1.0 - strandPercent * strandPercent;
+    #if %_RT_ALPHATEST
+        clip(pFurPass.alpha - max(GetMaterial_AlphaTest(), 0.01));
+    #endif
+
+    // Cannot use strandPercent from above for albedo attenuation, since alpha-blended edges of fur strands will
+    // never apply self-shadowing color. Instead, use inverse square distance from base as a good alternative
+    pFurPass.albedoAtten = 1.0 - FurParams.w;
+    pFurPass.albedoAtten = 1.0 - pFurPass.albedoAtten * pFurPass.albedoAtten;
+
+    pFurPass.vBaseScreen = AdjustFurBaseSampleTC(IN.vBaseScreen);
+    pFurPass.vTipScreen = AdjustFurTipSampleTC(IN.vTipScreen);
+
+    return FurPSInternal(IN.General, pFurPass);
+}
+
+technique General
+<
+    string Script =
+        "TechniqueZ=FurZPass;"
+        "TechniqueShadowGen=FurShadowGen;"
+>
+{
+    pass p0
+    {
+        VertexShader = FurShellVS();
+        PixelShader = FurShellPS();
+
+        ZEnable = true;
+        ZWriteEnable = false;
+        CullMode = Back;
+        ZFunc = LEqual;
+
+        AlphaBlendEnable = true;
+        SrcBlend = SrcAlpha;
+        DestBlend = InvSrcAlpha;
+    }
+}
+
+#include "FurFinPass.cfi"
+#include "FurObliteratePass.cfi"
+#include "FurZPass.cfi"

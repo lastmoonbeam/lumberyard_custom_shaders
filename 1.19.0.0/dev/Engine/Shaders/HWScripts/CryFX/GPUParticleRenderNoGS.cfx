@@ -1,0 +1,950 @@
+#include "Common.cfi"
+#include "GPUParticle.cfi"
+#include "GPUParticleHelpers.cfi"
+#include "GPUParticleCurves.cfi"
+
+#include "ParticlesShadowPass.cfi"
+
+// Lighting support
+#include "ShadeLib.cfi"
+#include "LightVolumes.cfi"
+
+// Mark shader as a "Custom" drawable shader.
+float Script: STANDARDSGLOBAL
+<
+string Script =
+    "NoPreview;"
+    "LocalConstants;"
+    "ShaderDrawType = Custom;"
+    "ShaderType = FX;"
+    >;
+
+SamplerState diffuseSampler
+{
+    Filter = MIN_MAG_LINEAR_MIP_POINT;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+#define DIS_EPSILON 0.001f
+#define MOTION_EPSILON 1e-4
+#define ALBEDOMAP_EPSILON 0.005f
+
+struct PsIn {
+    float4 position : SV_Position;
+    float4 texCoord : TEXCOORD1;
+#if !%_RT_GPU_PARTICLE_SHADOW_PASS
+    float3 ndcXYW : TEXCOORD0;
+    float4 shBase0 : SHBase0;
+    float4 shBase1 : SHBase1;
+    float4 shBase2 : SHBase2;
+    nointerpolation float3 normal : Normal;
+    nointerpolation float lengthParallelAxis : LengthParallelAxis;
+    nointerpolation float3 tangent : Tangent;
+    nointerpolation uint random : Random;
+    nointerpolation float3 bitangent : BiTangent;
+#endif
+    nointerpolation float distanceFade : DistanceFade;
+    nointerpolation float4 color    : COLOR0;
+    nointerpolation float particleAge : ParticleAge;
+#if %_RT_MOTION_BLUR
+    // xy->motion vector, zw->direction of fragment from particle center
+    noperspective float4 motionBlur : MotionBlur;
+#endif
+#if %_RT_GPU_PARTICLE_UV_ANIMATION && %_RT_ANIM_BLEND
+    nointerpolation float animationFrameAge : AnimationFrameAge;
+#endif
+#if %_RT_GPU_PARTICLE_SHADOW_PASS && %_RT_CUBEMAP0
+    float depth : ParticleDepth;
+#endif
+};
+
+float4x4                        Modelview;
+float4x4                        Projection;
+float4                          CameraXAxis;
+float4                          CameraYAxis;
+float4                          CameraLookDir;
+float4                          ParticleInitAnglesXYZ;
+float4                          ed_stretch_pivotOffset_flipChanceY; //flip can either happen across the y or x axis, the two values are distributed
+                                                                    //between constants that had free components
+float4                          ed_tilesXY_firstTile_variantCount;
+float4                          ed_numFrames_frameRate_blend_flipChanceX;
+float4                          ed_softParticlesAndBackLighting;
+float4                          ed_Emissive_FadeCoefficients;    // x -> emissive multiplier, yzw -> coefficients for distance fade formula
+// x-> Camera Distance Offset, yz -> Near/Far Fade Strength, w -> Threshold value to distinguish near and far fade
+
+float4                          ed_lodAlpha_PixelDiscard_motionBlurStrength;
+
+float4                          ed_DistOffset_FadeStrengths_FadeThreshold;
+float4                          ed_aspectRatio; //.x -> aspectRatio
+float4                          CameraPosition; //.xyz -> position
+
+float4                          BufferOffset; //.x -> bufferOffset, .yzw -> unused
+float4                          EmitterPosition;
+float4                          ViewVector;
+
+float4                          Spawn_ColorTint;
+
+//needed for orient-to-circle
+float4                          EmitterAxis;
+float4                          EmitterRight;
+
+StructuredBuffer<Particle>      ParticleData                : register(t6);
+StructuredBuffer<uint2>         ParticleSortIndices         : register(t7);
+
+Texture2D<float4>               ParticleTextureDiffuse      : register(t0);
+Texture2D<float4>               DepthBuffer                 : register(t5);
+
+Texture2D<float4>               NormalMap                   : register(t3);
+Texture2D<float4>               GlowMap                     : register(t4);
+
+SamplerState depthSampler : register(s5);
+
+#if %_RT_MULTI_LAYER_ALPHA_BLEND
+#include "MultiLayerAlphaBlend.cfi"
+RasterizerOrderedStructuredBuffer<MLABPackedLayer> MultiLayerAlphaBlendBuffer : register(u5); // per-layer pixel data for alpha
+#endif
+
+float GetShadowOccl(float3 worldPos, float3 worldNormal)
+{
+    half objectsShadow = 1.0f;
+    half cloudsShadow = 1.0f;
+    
+    // object shadows
+    float4 shadowWPos = float4(worldPos,1);
+    vert2fragShadowCommon shadowTC;
+    GenShadowTC(shadowWPos, shadowTC);
+    objectsShadow = ShadowDepthTest(shadowTC, worldNormal*0.125).r;
+
+    // cloud shadows
+#if %_RT_LIGHT_TEX_PROJ
+    float2 uv = ComputeCloudShadowMapUV(worldPos);
+    cloudsShadow = saturate( tex2Dlod(cloudShadowMap, float4((uv * CloudShadowAnimParams.xy - CloudShadowAnimParams.zw) , 0, 0)).r * CloudShadowParams.w );
+    cloudsShadow = lerp ( cloudsShadow, 1 - cloudsShadow, CloudShadowParams.z ); // 0 = do not invert, 1 invert
+#endif
+
+    return min(objectsShadow, cloudsShadow);
+}
+
+void GenerateVertex(inout PsIn Out, const float3 pos, const float3 prev_pos, const float4 texCoord,
+    const float3 normal, float2 NDCParticleCenter)
+{
+    float4 clipSpace = mul(Projection, mul(Modelview, float4(pos, 1.0)));
+
+#if %_RT_MOTION_BLUR
+    float4 prevClipSpace = mul(Projection, mul(Modelview, float4(prev_pos, 1.0)));
+
+    //positions in NDC space
+    float2 NDCCurrPos = clipSpace.xy / clipSpace.w;
+    float2 NDCPrevPos = prevClipSpace.xy / prevClipSpace.w;
+
+    //to make sure that 1 unit is the same amount on screen in both x and y direction
+    NDCCurrPos.x *= ed_aspectRatio.x;
+    NDCPrevPos.x *= ed_aspectRatio.x;
+    NDCParticleCenter.x *= ed_aspectRatio.x;
+
+    float2 NDCVertexMotion = ed_lodAlpha_PixelDiscard_motionBlurStrength.z * (NDCCurrPos - NDCPrevPos);
+
+    float2 NDCMotionVector = NDCVertexMotion;
+
+    float2 NDCRadius = NDCCurrPos - NDCParticleCenter;
+    float2 VertexDirectionLocal = normalize(NDCRadius);
+    float motionLength = length(NDCMotionVector);
+
+    //we are going to blend between a stretched previous and current position based on the
+    //movement direction, if there was actual motion. See the motion blur code in
+    // ParticleVT.cfi for reference
+    float blendRatio = 1;
+    [branch]
+    if (motionLength > MOTION_EPSILON)
+    {
+        float2 NDCMotionDirection = NDCMotionVector / motionLength;
+        motionLength = min(motionLength, 0.5); //Grab the value from CPU particle
+        motionLength *= motionLength;
+        NDCMotionVector = NDCMotionDirection * motionLength;
+
+        blendRatio = dot(VertexDirectionLocal, NDCMotionDirection);
+        //Rescale blendRatio from [-1, 1] to [0, 1]
+        blendRatio = 0.5 + 0.5 * blendRatio;
+
+        //stretch
+        static const float ForwardBackwardRatio = 0.75; // Grab the value from CPU particle
+        prevClipSpace.xy = NDCPrevPos - NDCMotionVector * ForwardBackwardRatio;
+        clipSpace.xy = NDCCurrPos + NDCMotionVector * (1.0 - ForwardBackwardRatio);
+
+        //back to NDC
+        prevClipSpace.x /= ed_aspectRatio.x;
+        clipSpace.x /= ed_aspectRatio.x;
+
+        //back to clip space
+        prevClipSpace.xy *= prevClipSpace.w;
+        clipSpace.xy *= clipSpace.w;
+    }
+
+    clipSpace = lerp(prevClipSpace, clipSpace, blendRatio);
+    Out.motionBlur = float4(NDCMotionVector, VertexDirectionLocal);
+#endif
+
+    // calculate SH lighting
+#if !%_RT_GPU_PARTICLE_SHADOW_PASS
+    half shadowOccl = 1.0;
+    half4 SHBase0, SHBase1, SHBase2;
+#if %_RT_PARTICLE_SHADOW
+    shadowOccl = GetShadowOccl(pos, normal);
+#endif
+    ProjectLightVolumeToSH(float4(pos, shadowOccl), Ambient, float4(Out.color.rgb, ed_softParticlesAndBackLighting.w), normal, SHBase0, SHBase1, SHBase2);
+#endif
+    Out.position = clipSpace;
+    Out.texCoord = texCoord;
+#if !%_RT_GPU_PARTICLE_SHADOW_PASS
+    Out.ndcXYW = float3(clipSpace.xy / clipSpace.w, clipSpace.w);
+    Out.shBase0 = SHBase0;
+    Out.shBase1 = SHBase1;
+    Out.shBase2 = SHBase2;
+#endif
+#if %_RT_GPU_PARTICLE_SHADOW_PASS && %_RT_CUBEMAP0
+    Out.depth = (clipSpace.z / PerShadow_FrustumInfo.y);
+#endif
+}
+
+float ComputeFade(float dist)
+{
+    float distOffset = dist + ed_DistOffset_FadeStrengths_FadeThreshold.x;
+    //avoid issues caused by negative offsets
+    distOffset = max(distOffset, 0);
+    float sqDist = distOffset * distOffset;
+
+    float fadeVal = ed_Emissive_FadeCoefficients.y +
+        ed_Emissive_FadeCoefficients.z * sqDist +
+        ed_Emissive_FadeCoefficients.w * sqDist * sqDist;
+
+    fadeVal = saturate(fadeVal);
+
+    //set to near, overwrite with far if over the threshhold
+    float fadeStrength = ed_DistOffset_FadeStrengths_FadeThreshold.y;
+    if (sqDist > ed_DistOffset_FadeStrengths_FadeThreshold.w)
+        fadeStrength = ed_DistOffset_FadeStrengths_FadeThreshold.z;
+
+    return pow(fadeVal, fadeStrength);
+}
+
+void GetOrientationVectors(in float3 dir, out float3 x, out float3 y, out float3 z)
+{
+    z = normalize(dir);
+    if (abs(dot(z, float3(0,0,1))) > (1.0 - EPSILON))
+    {
+        x = cross(float3(0,1,0), z);
+    }
+    else
+    {
+        x = cross(float3(0,0,1), z);
+    }
+    y = cross(z,x);
+}
+
+void GetShapeBasis(inout float3 x, inout float3 y, inout float3 z, Particle p)
+{
+#if %_RT_GPU_PARTICLE_SHAPE_BOX
+    //facing code taken from CPU implementation in ParticleRender.cpp
+
+    //find corners of bounding volume
+    float3 minCorner = EmitterPosition.xyz - ed_emitterBounds.xyz;
+    float3 maxCorner = EmitterPosition.xyz + ed_emitterBounds.xyz;
+
+    //compute distance along each axis from closer side
+    float3 distances;
+    distances.x = (p.position.x < EmitterPosition.x ? minCorner.x : maxCorner.x) - p.position.x;
+    distances.y = (p.position.y < EmitterPosition.y ? minCorner.y : maxCorner.y) - p.position.y;
+    distances.z = (p.position.z < EmitterPosition.z ? minCorner.z : maxCorner.z) - p.position.z;
+    distances = abs(distances);
+
+    bool xLessY = distances.x <= distances.y;
+    bool xLessZ = distances.x <= distances.z;
+    bool yLessZ = distances.y <= distances.z;
+
+    float3 direction;
+
+    if (xLessY && xLessZ)
+    {
+        direction = float3(p.position.x < EmitterPosition.x ? -1.0 : 1.0, 0.0, 0.0);
+    }
+    else if (!xLessY && yLessZ)
+    {
+        direction = float3(0.0, p.position.y < EmitterPosition.y ? -1.0 : 1.0, 0.0);
+    }
+    else
+    {
+        direction = float3(0.0, 0.0, p.position.z < EmitterPosition.z ? -1.0 : 1.0);
+    }
+
+    GetOrientationVectors(direction, x, y, z);
+#elif %_RT_GPU_PARTICLE_SHAPE_SPHERE || %_RT_GPU_PARTICLE_SHAPE_POINT
+
+    float3 dir = p.position.xyz - EmitterPosition.xyz;
+    if (dot(dir, dir) > EPSILON)
+    {
+        GetOrientationVectors(dir, x, y, z);
+    }
+
+#elif %_RT_GPU_PARTICLE_SHAPE_CIRCLE
+
+
+    float3 dir = p.position.xyz - EmitterPosition.xyz;
+    dir = normalize(dir);
+    if (dot(dir, dir) > EPSILON)
+    {
+        y = EmitterAxis.xyz;
+        if (dot(EmitterAxis, dir) > (1 - EPSILON))
+        {
+            x = EmitterRight.xyz;
+            z = cross(x,y);
+        }
+        else
+        {
+            x = cross(y, dir);
+            z = cross(x, y);
+        }
+    }
+
+#endif
+}
+
+//! Determines the on-screen angle of a world-space velocity vector projected onto the screen.
+//! \param position Position of a particle in world-space
+//! \param velocity Velocity in world-space, of a particle at "position"
+//! \return  radians above the screen X axis, or PI/2 if the projected velocity is 0
+float CalcOnScreenVelocityAngle(float3 position, float3 velocity)
+{
+    const float epsilon = 0.000001;
+    if(length(velocity) < epsilon) return PI/2;
+
+    const float aspectRatio = ed_aspectRatio.x;
+
+    const float3 velocityNorm = normalize(velocity);
+
+    float4 startPos = float4(position, 1);
+    float4 endPos = float4(position + velocityNorm, 1);
+
+    float4 startPos_proj = mul(Projection, mul(Modelview, startPos));
+    startPos_proj /= startPos_proj.w;
+    startPos_proj.x *= aspectRatio;
+
+    float4 endPos_proj = mul(Projection, mul(Modelview, endPos));
+    endPos_proj /= endPos_proj.w;
+    endPos_proj.x *= aspectRatio;
+    
+    float4 direction = endPos_proj - startPos_proj;
+    
+    // If the endPos goes behind the near clip plane, then the dividy-by-z causes a sign flip that we need to account for:
+    float flip = sign(endPos_proj.z);
+
+    // When screen-space velocity is 0, prevent atan2(0,0) because it's undefined. Instead do atan2(1,0) to keep the particle facing up.
+    const float isDirectionZero = length(direction.xy) < epsilon;
+    
+    const float velocityAngle = atan2(flip * direction.y + isDirectionZero, flip * direction.x);
+
+    return velocityAngle;
+}
+
+//! Takes a baseline particle space matrix and applies the various required transformations to it, including user rotation, velocity stretching, and scaling.
+//! By "baseline" we mean the initial local particle space definition, which has special orientation constraints already applied, like facing camera,
+//! oriented to velocity, etc. Standard/common subsequent transformations are then handled here.
+//! \param particleSpace Baseline particle space with any "special" default orientation parameters already applied
+//! \param rotation User rotation amounts
+//! \param scaleXY User scale for the particle
+//! \return Tranformed particleSpace for the final particle position with respect to world space.
+float3x3 TransformParticleSpace(const float3x3 particleSpace, const float3 rotation, const float3 velocityStretched, float2 scaleXY)
+{
+    // Apply any accumulated rotation
+    // Optimization opportunity: combine quatToRotationMatrix() and quatRotationXYZ(). I tried porting SetRotationXYZ() from Cry_Matrix33.h but this does ZYX order instead of XYZ.
+    float3x3 rotMat = quatToRotationMatrix(quatRotationXYZ(rotation));
+
+    float3x3 rotatedParticleSpace = mul(particleSpace, rotMat);
+
+    float3 tangent = normalize(rotatedParticleSpace[0]);
+    float3 bitangent = normalize(rotatedParticleSpace[1]);
+    const float3 normal = cross(tangent, bitangent);
+
+    tangent *= scaleXY.x;
+    bitangent *= scaleXY.y;
+
+    float lengthVal = length(velocityStretched);
+    if (lengthVal >= EPSILON)
+    {
+        tangent = tangent + velocityStretched * (dot(tangent, velocityStretched) / (lengthVal * scaleXY.x));
+        bitangent = bitangent + velocityStretched * (dot(bitangent, velocityStretched) / (lengthVal * scaleXY.y));
+    }
+
+    return float3x3(tangent, bitangent, normal);
+}
+
+PsIn VS(uint vertexCornerIndex : SV_VertexID, uint particleSortIndex : SV_InstanceID)
+{
+    PsIn Out;
+
+    // grab particle
+    uint particleIndex = ParticleSortIndices[particleSortIndex + asint(BufferOffset.x)].x;
+    Particle p = ParticleData[particleIndex];
+
+    const float normalizedParticleAge = 1.0 - (p.life / p.lifeMax);
+
+    // set position to NaN for when we early discard particle
+    const float NaN = asfloat(0x7FBFFFFF);
+    Out.position = float4(NaN, NaN, NaN, NaN);
+
+    [branch]
+    if (normalizedParticleAge > 1.0)
+    {
+        return Out;
+    }
+#if SHAPE_NEEDS_ESTIMATED_VELOCITY
+    else if (p.deltaTime == 0.0)
+    {
+        // In some permutations, we have to skip the first frame of rendering to get valid previous position data.
+        return Out;
+    }
+#endif
+    else
+    {
+        // sample curves
+        const float curveLifetimeScaleX = GetValueFromCurve(2, normalizedParticleAge);
+        const float curveLifetimeScaleY = GetValueFromCurve(3, normalizedParticleAge);
+        const float curveLifetimePivotX = GetValueFromCurve(18, normalizedParticleAge);
+        const float curveLifetimePivotY = GetValueFromCurve(19, normalizedParticleAge);
+        const float curveLifetimeStretch = GetValueFromCurve(20, normalizedParticleAge);
+
+        const float4 curveColorAge0 = float4(GetValueFromCurve(10, normalizedParticleAge), GetValueFromCurve(11, normalizedParticleAge), GetValueFromCurve(12, normalizedParticleAge), GetValueFromCurve(13, normalizedParticleAge));
+        const float4 curveColorAge1 = float4(GetValueFromCurve(14, normalizedParticleAge), GetValueFromCurve(15, normalizedParticleAge), GetValueFromCurve(16, normalizedParticleAge), GetValueFromCurve(17, normalizedParticleAge));
+
+        // straightly pipe into ps
+        Out.color = max(float4(0.0, 0.0, 0.0, 0.0), p.rgba * lerp(curveColorAge0, curveColorAge1, rand_uintToFloat(rand_lcg(p.random0))) * Spawn_ColorTint);
+        Out.particleAge = normalizedParticleAge;
+    #if !%_RT_GPU_PARTICLE_SHADOW_PASS
+        Out.random = p.random0;
+    #endif
+
+        // calculate final stretch value over velocity vector
+        float stretch = p.stretch * curveLifetimeStretch;
+        
+        // dont allow stretching back more than starting position
+        const float inversePivotOffset = 1.0 - ed_stretch_pivotOffset_flipChanceY.x;
+        if((stretch * inversePivotOffset) > normalizedParticleAge)
+        {
+            stretch = normalizedParticleAge / inversePivotOffset;
+        }
+        
+        float3 prevPosition;
+        prevPosition.xy = p.previous_position_xy;
+        prevPosition.z = p.previous_rotation_pos_z.w;
+
+        float3 velocity = p.velocity.xyz;
+    #if SHAPE_NEEDS_ESTIMATED_VELOCITY
+        // p.velocity.xyz isn't valid for these shapes, so we estimate it using the previous position.
+        // Estimating the velocity over time is much simpler than trying to attain velocity by more direct means, given
+        // the complex space transformations involved (i.e. x means radius, y means longitudinal rotation, etc).
+        // Note, in order for this to work right we have to skip rendering the first frame. There is an early return above.
+        velocity = (p.position - prevPosition) / p.deltaTime;
+    #endif
+
+        float3 velocityStretched = velocity * stretch;
+
+    #if %_RT_MOTION_BLUR
+        float3 prevRotation = p.previous_rotation_pos_z.xyz;
+        prevPosition += velocityStretched * ed_stretch_pivotOffset_flipChanceY.x;
+    #endif
+
+        float3 rotation = p.rotation.xyz;
+
+        // orient to velocity, note that the multiply with 0.5 is to go from flag value 2 to 1 (flag >> 1)
+        float isFreeFacing = float(getParticleFlag(p.flags, PARTICLE_FLAG_FREE_FACING));
+        float isShapeFacing = float(getParticleFlag(p.flags, PARTICLE_FLAG_FACING_SHAPE));
+        float isCameraFacing = (1.0 - isFreeFacing) * (1.0 - isShapeFacing);
+        float orientToVelocity = float(getParticleFlag(p.flags, PARTICLE_FLAG_ORIENTTOVELOCITY));
+        
+        // This particleSpace rotation matrix will be adjusted to satisfy various alignment requirements,
+        // and the final result will be used to position the vertices.
+        // The shader orignally treated this as a left-handed coordinate system. It's kind of goofy, but we have kept it as-is to mitigate risk of changing it at this time.
+        // TODO: It would be nice to make this use a right-handed coordinate system.
+        float3x3 particleSpace =
+            { 1, 0, 0,
+              0, 0, 1,
+              0, -1, 0 };
+
+        // Camera facing orient to velocity branch, note that we basically check three states that we can reduce to 1 branch by multiplication.
+        // This should result in more efficient GPU code.
+        [branch]
+        if((isCameraFacing * orientToVelocity) != 0.0)
+        {
+            const float velocityAngle = CalcOnScreenVelocityAngle(p.position.xyz, velocity);
+            const float particleAngle = PI * 0.5f;
+            const float rotateAngle = velocityAngle - particleAngle;
+
+            particleSpace[0] = CameraXAxis;
+            particleSpace[1] = CameraYAxis;
+            particleSpace[2] = CameraLookDir; // particleSpace is using a left-handed coordinate system.
+
+            // Note we apply the local Z rotation here because it has special meaning for camera-facing particles.
+            // For consistency with CPU particles, this is specified as Y rotation.
+            // The -rotation.y is likely due to the data assuming a right-hand CS, but particleSpace is left-hand.
+            float3x3 rotateZ = axisRotationMatrix(rotateAngle - rotation.y, particleSpace[2]);
+
+            particleSpace = mul(particleSpace, rotateZ);
+            
+            // Cancel out rotation since we just applied the Y-rotation above and the user should not be able to rotate away from camera facing.
+            rotation = float3(0, 0, 0);
+
+        #if %_RT_MOTION_BLUR
+            prevRotation = float3(0, 0, 0);
+        #endif
+        }
+        else if (isCameraFacing)
+        {
+            // Set axes to camera plane, keeping the X axis horizontal.
+            particleSpace[2] = normalize(p.position - CameraPosition);
+            particleSpace[0] = normalize(float3(particleSpace[2].y, -particleSpace[2].x + EPSILON, 0));
+            particleSpace[1] = cross(particleSpace[0], particleSpace[2]);
+
+
+            float3x3 rotateZ = axisRotationMatrix(-rotation.y, particleSpace[2]);
+            particleSpace = mul(particleSpace, rotateZ);
+
+            // Cancel out rotation since we just applied the Y-rotation above and the user should not be able to rotate away from camera facing.
+            rotation = float3(0, 0, 0);
+
+        #if %_RT_MOTION_BLUR
+            prevRotation = float3(0, 0, 0);
+        #endif
+        }
+        // free facing orient to velocity branch
+        else if(isFreeFacing * orientToVelocity != 0.0)
+        {
+            // CPU and GPU particles work a bit different in this case.
+            // For CPU particles it accumulates incremental align-to-velocty rotations every frame, which introduces some twisting. We don't have
+            // proper support for this accumulation for GPU particles (the Particle struct's rotation field would need to be upgraded to quaternion or at least
+            // euler-vector). But by aliging to the velocity vector with the particle facing up, we at least get relatively intuitive/predictable results,
+            // and the alignment is at least somewhat similar to CPU particles.
+
+            // This forces us to support spinning around the velocity axis in a special way. The CPU supports this by applying user rotation (InitAngles parameter)
+            // first, then clamping to the velocity vector, and accumulating the rotations per frame. Since the GPU support this accumulation, we have to
+            // specifically apply the spin rotation (specified in Z). To make this work reliably, we ignore the X and Y rotations which is different from CPU
+            // but appropriate since we don't intend to support X Y rotations on the CPU anyway since that would break velocity-orientation.
+
+            particleSpace[1] = normalize(velocity);
+            particleSpace[0] = cross(particleSpace[1], float3(0, 0, 1));
+            particleSpace[2] = cross(particleSpace[0], particleSpace[1]);
+
+            float3x3 spin = axisRotationMatrix(rotation.z, particleSpace[1]);
+
+            particleSpace = mul(particleSpace, spin);
+            
+            // Cancel out rotation since we just applied the spin rotation above and the user should not be able to rotate away from velocity alignment.
+            rotation = float3(0, 0, 0);
+
+        #if %_RT_MOTION_BLUR
+            prevRotation = float3(0, 0, 0);
+        #endif
+        }
+
+        if (isShapeFacing)
+        {
+            GetShapeBasis(particleSpace[0], particleSpace[1], particleSpace[2], p);
+        }
+
+        float2 scaleXY = float2(p.scale.x * curveLifetimeScaleX, p.scale.y * curveLifetimeScaleY);
+
+        const float3x3 transformedParticleSpace = TransformParticleSpace(particleSpace, rotation, velocityStretched, scaleXY);
+        
+    #if !%_RT_GPU_PARTICLE_SHADOW_PASS
+        Out.tangent = normalize(transformedParticleSpace[0]);
+        Out.bitangent = normalize(transformedParticleSpace[1]);
+        Out.normal = transformedParticleSpace[2];
+        //Calculate the thickness of the soft particle
+        Out.lengthParallelAxis = 2.0 / length(transformedParticleSpace[0] + transformedParticleSpace[1]);
+    #endif
+
+        float2 pivotXY = p.pivotXY * float2(curveLifetimePivotX, curveLifetimePivotY);
+        float3 particleCenter = p.position.xyz + velocityStretched * ed_stretch_pivotOffset_flipChanceY.x;
+        particleCenter += pivotXY.x * transformedParticleSpace[0] + pivotXY.y * transformedParticleSpace[1];
+
+        Out.distanceFade = ComputeFade(distance(particleCenter, CameraPosition.xyz));
+
+        //don't bother drawing the particle if it would be barely visible anyways
+        [branch]
+        if (Out.distanceFade < DIS_EPSILON)
+        {
+            return Out;
+        }
+        else
+        {
+        #if %_RT_MOTION_BLUR
+
+            const float3x3 prev_transformedParticleSpace = TransformParticleSpace(particleSpace, prevRotation, velocityStretched, scaleXY);
+
+            float3 previousPosition = prevPosition;
+            previousPosition += pivotXY.x * prev_transformedParticleSpace[0] + pivotXY.y * prev_transformedParticleSpace[1];
+            float4 particleCenterClipSpace = mul(Projection, mul(Modelview, float4(particleCenter, 1)));
+            float2 NDCParticleCenter = particleCenterClipSpace.xy / particleCenterClipSpace.w;
+        #else
+            //if no motion blur is applied these parameters are not used, but since the function still
+            //takes them, just pass in anything
+            float3 previousPosition = 0;
+            float2 NDCParticleCenter = 0;
+            const float3x3 prev_transformedParticleSpace = 0;
+        #endif
+
+
+        #if %_RT_GPU_PARTICLE_UV_ANIMATION
+            // calculate animation frame
+            float frameRate = ed_numFrames_frameRate_blend_flipChanceX.y == 0 ? 1.0 : (p.lifeMax / ed_numFrames_frameRate_blend_flipChanceX.x) / (1.0 / ed_numFrames_frameRate_blend_flipChanceX.y );
+
+            const uint uvAnimationFlags = asuint(ed_numFrames_frameRate_blend_flipChanceX.z);
+            const float uvAnimationBlendEnabled = getParticleFlag(uvAnimationFlags, UV_ANIMATION_BLEND_ENABLED);
+
+            int variance = p.random0 % int(ed_tilesXY_firstTile_variantCount.w);
+
+            int startTileOffset = variance + ed_tilesXY_firstTile_variantCount.z;
+
+            const float oneOverFrame = 1.0 / ed_numFrames_frameRate_blend_flipChanceX.x;
+            const float ageFrameRate = normalizedParticleAge * frameRate;
+            const float startFrameOffset = startTileOffset * oneOverFrame;
+            const float mirrorSpeedupMultiplier = ed_numFrames_frameRate_blend_flipChanceX.x / (ed_numFrames_frameRate_blend_flipChanceX.x - startTileOffset);
+
+            // note that the 0.99 is a bias to make sure that the value stays on the last frame
+            const float firstFrame = ageFrameRate > oneOverFrame ? 1.0 : 1.0 - uvAnimationBlendEnabled * 1.0;
+
+            const float uvAnimationDoOnce = getParticleFlag(uvAnimationFlags, UV_ANIMATION_CYCLE_ONCE);
+            const float uvAnimationDoRepeat = getParticleFlag(uvAnimationFlags, UV_ANIMATION_CYCLE_REPEAT);
+            const float uvAnimationDoMirror = getParticleFlag(uvAnimationFlags, UV_ANIMATION_CYCLE_MIRROR);
+
+            float currentFrameTime = min(ageFrameRate + startFrameOffset, 0.999) * uvAnimationDoOnce;
+            currentFrameTime += ( startFrameOffset + fmod(ageFrameRate, 1.0 - startFrameOffset)) * uvAnimationDoRepeat;
+            currentFrameTime += (1.0 - (abs(fmod(ageFrameRate * mirrorSpeedupMultiplier, 2.0) - 1.0) * (1.0 - startFrameOffset))) * uvAnimationDoMirror;
+
+            const float currentFrame = currentFrameTime * ed_numFrames_frameRate_blend_flipChanceX.x;
+            float animationFrame0 = currentFrame - uvAnimationBlendEnabled;
+            float animationFrame1 = animationFrame0 + 1;
+            animationFrame0 = animationFrame0 < startTileOffset ? ed_numFrames_frameRate_blend_flipChanceX.x - 1 : animationFrame0;
+
+            const float2 maxUVForTile = float2(1.0, 1.0) / ed_tilesXY_firstTile_variantCount.xy;
+
+            // calculate first set of UVs
+            int y = int(animationFrame0 / ed_tilesXY_firstTile_variantCount.x);
+            int x = int(fmod(animationFrame0, ed_tilesXY_firstTile_variantCount.x));
+            float4 uvMin = float4(float2(x, y) * maxUVForTile * firstFrame, 0, 0);
+            float4 uvMax = float4(uvMin + maxUVForTile * firstFrame, 0, 0);
+
+        #if %_RT_ANIM_BLEND
+            // calculate interpolation set of UVs
+            int y2 = int(animationFrame1 / ed_tilesXY_firstTile_variantCount.x);
+            int x2 = int(fmod(animationFrame1, ed_tilesXY_firstTile_variantCount.x));
+            uvMin.zw = float2(x2, y2) * maxUVForTile;
+            uvMax.zw = uvMin.zw + maxUVForTile;
+
+            Out.animationFrameAge = frac(animationFrame1 - ceil(animationFrame0));
+        #endif
+        #else
+            float4 uvMin = float4(0, 0, 0, 0);
+            float4 uvMax = float4(1, 1, 0, 0);
+        #endif
+
+            // x flip chance
+            if (ed_numFrames_frameRate_blend_flipChanceX.w > rand_uintToFloat(rand_lcg(p.random0)))
+            {
+                float temp = uvMin.x;
+                uvMin.x = uvMax.x;
+                uvMax.x = temp;
+
+                temp = uvMin.z;
+                uvMin.z = uvMax.z;
+                uvMax.z = temp;
+            }
+
+            // y flip chance
+            if (ed_stretch_pivotOffset_flipChanceY.y > rand_uintToFloat(rand_lcg(p.random0)))
+            {
+                float temp = uvMin.y;
+                uvMin.y = uvMax.y;
+                uvMax.y = temp;
+
+                temp = uvMin.w;
+                uvMin.w = uvMax.w;
+                uvMax.w = temp;
+            }
+
+            // order should be (0,0) (1,0) (0,1) (1,1)
+            const float vertexCornerX = (float)(vertexCornerIndex & 1);
+            const float vertexCornerY = (float)(vertexCornerIndex / 2);
+
+            float3 vertexPos = particleCenter - transformedParticleSpace[0] + transformedParticleSpace[0] * vertexCornerX * 2.0 - transformedParticleSpace[1] + transformedParticleSpace[1] * vertexCornerY * 2.0;
+            float3 prevVertexPos = previousPosition - prev_transformedParticleSpace[0] + prev_transformedParticleSpace[0] * vertexCornerX * 2.0 - prev_transformedParticleSpace[1] + prev_transformedParticleSpace[1] * vertexCornerY * 2.0;
+
+            #if %_RT_GPU_PARTICLE_SHAPE_BOX
+            float3 originalEmitterPos = float3(p.position.w, p.velocity.w, p.rotation.w);
+
+            [branch]
+            if(!IsInEmitterConfineBounds(particleCenter, originalEmitterPos))
+            {
+                Out.position = float4(NaN, NaN, NaN, NaN);
+                return Out;
+            }
+            #endif
+
+            float4 uv = float4(lerp(uvMin.x,uvMax.x,vertexCornerX), lerp(uvMax.y,uvMin.y,vertexCornerY), lerp(uvMin.z,uvMax.z,vertexCornerX),lerp(uvMax.w,uvMin.w,vertexCornerY));
+
+            float4 clipSpacePosMax = mul(Projection, mul(Modelview, float4(particleCenter + transformedParticleSpace[0] + transformedParticleSpace[1], 1.0)));
+            float4 clipSpacePosMin = mul(Projection, mul(Modelview, float4(particleCenter - transformedParticleSpace[0] - transformedParticleSpace[1], 1.0)));
+
+            float3 ndcVertex = ClipSpaceToNDC(clipSpacePosMax);
+            float3 ndcCenter = ClipSpaceToNDC(clipSpacePosMin);
+
+            float2 pixelVertex = NDCToUV(ndcVertex) * PerView_ScreenSize.xy;
+            float2 pixelCenter = NDCToUV(ndcCenter) * PerView_ScreenSize.xy;
+
+            float2 offset = abs(pixelVertex - pixelCenter);
+
+            [branch]
+            if(offset.x <= ed_lodAlpha_PixelDiscard_motionBlurStrength.y && offset.y <= ed_lodAlpha_PixelDiscard_motionBlurStrength.y)
+            {
+                return Out;
+            }
+            else
+            {
+                GenerateVertex(Out, vertexPos, prevVertexPos, uv, transformedParticleSpace[2], NDCParticleCenter);
+            }
+            return Out;
+        }
+    }
+}
+
+
+struct PsOut
+{
+    float4 color : COLOR0;
+#if %_RT_GPU_PARTICLE_SHADOW_PASS && %_RT_CUBEMAP0
+    float depth : DEPTH;
+#endif
+};
+
+float4 ComputeDiffuseColor(PsIn In)
+{
+    float4 albedoMap = ParticleTextureDiffuse.Sample(diffuseSampler, In.texCoord.xy );
+
+#if %_RT_GPU_PARTICLE_UV_ANIMATION
+    #if %_RT_ANIM_BLEND
+        float animationAge = In.animationFrameAge;
+
+        // blend particle animation per frame
+        albedoMap += (ParticleTextureDiffuse.Sample(diffuseSampler, In.texCoord.zw ) - albedoMap) * animationAge;
+    #endif
+#endif
+
+    return albedoMap;
+}
+
+float4 ComputeGlowColor(PsIn In)
+{
+#if %_RT_GPU_PARTICLE_GLOW_MAP
+    float4 glowColor = GlowMap.Sample(diffuseSampler, In.texCoord.xy);
+    #if %_RT_ANIM_BLEND
+        glowColor += (GlowMap.Sample(diffuseSampler, In.texCoord.zw) - glowColor) * In.animationFrameAge;
+    #endif
+
+    return glowColor;
+#else
+    return In.color;
+#endif
+}
+
+float3 GetNormalFromMap(float2 texCoord)
+{
+    float4 normalMapValue = NormalMap.Sample(diffuseSampler, texCoord);
+
+    //match way that Normal map is calculated for the CPU particles
+    float3 normal;
+    normal.xy = normalMapValue.yx;
+    normal.z = sqrt(saturate(1.0 + dot(normal.xy, -normal.xy)));
+    return normal;
+}
+
+float3 ComputeTangentSpaceNormal(PsIn In)
+{
+#if %_RT_GPU_PARTICLE_NORMAL_MAP
+    float3 normal = GetNormalFromMap(In.texCoord.xy);
+    #if %_RT_ANIM_BLEND
+        float3 normalNextFrame = GetNormalFromMap(In.texCoord.zw);
+        normal += (normalNextFrame - normal) * In.animationFrameAge;
+    #endif
+    return normal;
+#else
+    return float3(0.0, 0.0, 1.0);
+#endif
+}
+
+void ApplyMotionBlur(inout float4 finalColor, float4 motionBlur)
+{
+    float motionLength = length(motionBlur.xy);
+    if (motionLength > MOTION_EPSILON)
+    {
+        // This is an arbitrary value that prevents particle disappearing completely if
+        // it is moving too fast while it still blurs.
+        static const float minOpacity = 0.2;
+        // The following magic numbers are taken from motion blur implementation in Particles.cfi
+        float motionStrength = motionLength * 10;
+
+        float stretchRatio = saturate(abs(dot(motionBlur.zw,
+            motionBlur.xy / motionLength)) * 1.3);
+
+        float opacityCoefficient = saturate(motionStrength * stretchRatio);
+        opacityCoefficient = 1.0 - opacityCoefficient;
+        opacityCoefficient *= opacityCoefficient;
+        opacityCoefficient = opacityCoefficient * (1.0 - minOpacity) + minOpacity;
+
+        finalColor.a *= opacityCoefficient;
+    }
+}
+
+EARLYDEPTHSTENCIL
+PsOut PS(PsIn In)
+{
+    PsOut Out;
+
+    float4 albedoMap = ComputeDiffuseColor(In);
+
+    albedoMap.a *= In.color.a;
+
+    [branch]
+    if(albedoMap.a < ALBEDOMAP_EPSILON)
+        discard;
+
+    // convert normal from tangent space to world space
+    float3 tangentNormal =  ComputeTangentSpaceNormal(In);
+    const half3x3 tangentToWS = half3x3(In.tangent, In.bitangent, In.normal);
+    float3 normal = normalize(mul(tangentNormal, tangentToWS));
+
+    float3 diffuseAccumulation = GetEnvLighting( In.shBase0, In.shBase1, In.shBase2, normal);
+    float4 finalColor = float4(diffuseAccumulation, albedoMap.a);
+
+    finalColor.rgb *= albedoMap.rgb;
+
+    //Add particle glow/emissive
+    float4 glowColor = ComputeGlowColor(In);
+    finalColor.rgb += albedoMap.a * albedoMap.rgb * glowColor.rgb * ed_Emissive_FadeCoefficients.xxx;
+
+    #if %_RT_SOFT_PARTICLE
+        if(ed_softParticlesAndBackLighting.x)
+        {
+            float2 particlePositionScreenUV = NDCToUV(In.ndcXYW.xyz);
+
+            float depthSample = DepthBuffer.SampleLevel(depthSampler, particlePositionScreenUV, 0.0).x * PerView_NearFarClipDist.y;
+
+            const float softParticleStrength = ed_softParticlesAndBackLighting.y;
+
+            const float strength = In.lengthParallelAxis * softParticleStrength;
+            const float dist = max( min(depthSample - In.ndcXYW.z, In.ndcXYW.z), 0.0);
+            const float softParticle = 1.0 - exp(-dist*dist*strength);
+            finalColor.a *= softParticle;
+        }
+    #endif
+
+    finalColor.a *= In.distanceFade * ed_lodAlpha_PixelDiscard_motionBlurStrength.x;
+
+#if %_RT_MOTION_BLUR
+    ApplyMotionBlur(finalColor, In.motionBlur);
+#endif
+
+    if(finalColor.a < 0.005)
+        discard;
+
+    // premultiply alpha
+    finalColor.rgb *= finalColor.a;
+
+    #if %_RT_MULTI_LAYER_ALPHA_BLEND
+
+        float depth = In.ndcXYW.z;
+        float transmittance = 1.0f - finalColor.a;
+
+        #if %_RT_ADDITIVE_BLENDING || !%_RT_ALPHABLEND
+            transmittance = 1.0f;
+        #endif
+
+        uint flags = 0;
+
+        // @TODO: Turn on depth fixup when this is available in GPU particles.
+        //#if %DEPTH_FIXUP
+        //    flags |= finalColor.a > DepthFixupThreshold ? MLAB_DO_DEPTH_FIXUP : 0;
+        //#endif
+
+        MLABInsertLayer(MultiLayerAlphaBlendBuffer, finalColor.rgb, transmittance.xxx, depth, flags, PerFrame_MultiLayerAlphaBlendData.x, int2(In.position.xy), int(PS_ScreenSize.x));
+        discard;
+
+    #endif
+
+    Out.color = finalColor;
+
+    return Out;
+}
+
+PsOut PSShadow(PsIn In)
+{
+    PsOut Out;
+
+    float4 albedoMap = ComputeDiffuseColor(In);
+
+    albedoMap.a *= In.color.a;
+
+    [branch]
+    if(albedoMap.a < ALBEDOMAP_EPSILON)
+        discard;
+
+    float4 finalColor = albedoMap;
+    #if %_RT_CUBEMAP0
+        Out.depth = In.depth;
+    #endif
+
+    finalColor.a *= In.distanceFade * ed_lodAlpha_PixelDiscard_motionBlurStrength.x;
+
+#if %_RT_MOTION_BLUR
+    ApplyMotionBlur(finalColor, In.motionBlur);
+#endif
+
+    if(finalColor.a < 0.005)
+        discard;
+
+    // premultiply alpha
+    finalColor.rgb *= finalColor.a;
+    Out.color = finalColor;
+
+    return Out;
+}
+
+// Techniques
+// ------------------------------------------------------------------
+
+technique General
+<
+    string Script =
+        "TechniqueShadowGen = ShadowGen;"
+>
+{
+    pass p0
+    {
+        ZEnable = true;
+        ZWriteEnable = false;
+        VertexShader = VS() ParticleVS;
+        PixelShader = PS() ParticlePS;
+        CullMode = None;
+        AlphaBlendEnable = true;
+    }
+}
+
+technique ShadowGen
+{
+    pass p0
+    {
+        VertexShader = VS() ParticleVS;
+        PixelShader = PSShadow() ParticlePS;
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = None;
+    }
+}

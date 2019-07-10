@@ -1,0 +1,19 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Source File.
+//  Shader extension
+//  Copyright (C), Crytek Studios, 2001-2012.
+// -------------------------------------------------------------------------
+//  File name:   ParticlesShadowGenPass.cfi
+//  Version:     v1.00
+//  Refactored:  01/05/12 by Tiago Sousa
+//  Compilers:  
+//  Description: Shadow map generation pass for particles
+//
+////////////////////////////////////////////////////////////////////////////
+
+float4 Foo(float4 vThis)
+{
+  return vThis;
+}
+

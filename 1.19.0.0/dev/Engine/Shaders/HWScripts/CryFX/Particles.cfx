@@ -1,0 +1,219 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+// particle shader used from particle effects specifying a material
+// code for actual shader is shared
+
+#define USE_MATERIAL
+
+#include "Common.cfi"
+#include "ParticleVT.cfi"
+#include "ModificatorVT.cfi"
+#include "ShadeLib.cfi"
+#include "LightVolumes.cfi"
+#include "ParticlesShadowPass.cfi"
+#include "ModificatorTC.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "Public;"
+           "NoPreview;"
+#if %DEPTH_FIXUP
+		"DepthFixup;"
+#endif
+#if %REFRACTION
+           "Refractive;"
+           "ShaderDrawType = General;"
+#else 
+           "ShaderDrawType = Light;"
+#endif
+
+           "ShaderType = Particle;";
+>;
+
+sampler2D diffuseSamplerAniso = sampler_state
+{
+  Texture = $Diffuse;
+  MinFilter = ANISOTROPIC;
+  MagFilter = ANISOTROPIC;
+  MipFilter = ANISOTROPIC;
+  AnisotropyLevel = 16;
+  sRGBLookup = true;
+};
+
+sampler2D diffuseSampler = sampler_state
+{
+  Texture = $Diffuse;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR;
+  sRGBLookup = true;
+};
+
+sampler2D specularSampler = sampler_state
+{
+  Texture = $Specular;
+  string UIName = "Specular";
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR;
+  sRGBLookup = true;
+}
+
+sampler2D customSampler = sampler_state
+{
+  Texture = $CustomMap;
+#if %SCREEN_SPACE_DEFORMATION
+  string UIName = "Refraction Normal";
+#elif %DEFORMATION
+  string UIName = "Deformation Normal";
+#endif
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR;
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+sampler2D customSecSampler = sampler_state
+{
+  Texture = $CustomSecondaryMap;
+  string UIName = "Colour Lookup Map";
+};
+
+sampler2D glowMapSampler = sampler_state
+{
+	Texture = $Detail;
+	string UIName = "Emissive Map";
+};
+
+#if %REFRACTION
+  float RefrBumpScale
+  <  
+    register = PER_MATERIAL_0.x;
+    string UIHelp = "Set refraction bump scale";                     
+    string UIName = "Refraction Bump Scale";    
+    
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 2.0;
+    float UIStep = 0.1;
+  > = 0.1;
+#endif
+
+#if %SCREEN_SPACE_DEFORMATION 
+
+float AnimSpeed
+<
+  register = PER_MATERIAL_0.w;
+  string UIName = "Perturbation anim speed";   
+  
+  string UIWidget = "slider";
+  float UIMin = -10.0;
+  float UIMax = 10.0;
+  float UIStep = 0.005;
+> = 0.2;
+
+float PerturbationScale
+<
+  register = PER_MATERIAL_1.x;
+  string UIName = "Perturbation tiling";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 32.0;
+  float UIStep = 0.005;
+> = 0.5;
+
+float PerturbationStrength
+<
+  register = PER_MATERIAL_1.y;
+  string UIName = "Perturbation amount";   
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 2.0;
+  float UIStep = 0.005;
+> = 0.01;
+
+#elif %DEFORMATION
+
+float DeformTile
+<
+  register = PER_MATERIAL_1.x;
+  string UIName = "Deform tiling";     
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.005;
+> = 0.1;
+
+float DeformAmount
+<
+  register = PER_MATERIAL_1.y;
+  string UIName = "Deform amount";     
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 0.2;
+  float UIStep = 0.005;
+> = 0.0;
+
+float DeformAnimSpeed
+<
+  register = PER_MATERIAL_1.z;
+  string UIName = "Deform anim speed";     
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.005;
+> = 0.0;
+
+#endif
+
+#if %COLOR_LOOKUP
+
+
+float ColLookupAmplitude
+<
+  register = PER_MATERIAL_2.x;
+  string UIName = "Color lookup amplitude";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 32.0;
+  float UIStep = 0.005;
+> = 1.0;
+
+float ColLookupColPhase
+<
+  register = PER_MATERIAL_2.y;
+  string UIName = "Color lookup color phase";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 32.0;
+  float UIStep = 0.005;
+> = 1.0;
+
+#endif
+
+half GlobalIlluminationAmount
+<
+  register = PER_MATERIAL_4.w;
+  string UIName = "Global Illumination Amount";   
+  
+  string UIWidget = "slider";
+  float UIMin = 0.01;
+  float UIMax = 30.0;
+  float UIStep = 0.01;
+> = 1;
+
+#include "Particles.cfi"

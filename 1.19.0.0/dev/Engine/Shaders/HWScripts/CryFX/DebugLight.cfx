@@ -1,0 +1,107 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =        
+           "ShaderDrawType = Light;"
+>;
+
+// Structs
+
+
+struct SDebugLightApp2VS
+{
+	float4 pos : POSITION0;
+};
+
+
+struct SDebugLightVS2PS
+{
+	float4 pos : POSITION0;
+	float4 col : COLOR0;
+};
+
+// General pass
+
+
+SDebugLightVS2PS
+DebugLightVS( SDebugLightApp2VS IN )
+{
+  SDebugLightVS2PS OUT = (SDebugLightVS2PS) 0;
+  OUT.pos = mul( vpMatrix, IN.pos );
+  OUT.col = GetInstance_AmbientOpacity();
+  return OUT;
+}
+
+
+float4
+DebugLightPS( SDebugLightVS2PS IN ) : COLOR0
+{
+  return IN.col;
+}
+
+
+technique General
+<
+  string Script =
+        "TechniqueZ=DebugLightZPass;"
+>
+{
+  pass p0
+  {
+    //ZEnable = true;    
+    //ZWriteEnable = true;    
+		//ZFunc = Equal;
+    //CullMode = Back;        
+		
+    VertexShader = DebugLightVS();
+    PixelShader = DebugLightPS();
+  }
+}
+
+
+// Z pass
+
+SDebugLightVS2PS
+DebugLightZVS( SDebugLightApp2VS IN )
+{
+  SDebugLightVS2PS OUT = (SDebugLightVS2PS) 0;
+  OUT.pos = mul( vpMatrix, IN.pos );
+  return OUT;
+}
+
+
+float4
+DebugLightZPS( SDebugLightVS2PS IN ) : COLOR0
+{
+  return 0.001;
+}
+
+
+technique DebugLightZPass
+{
+  pass p0
+  {    
+    //ZEnable = true;
+    //ZWriteEnable = true;        
+		//ZFunc = LEqual;
+    //CullMode = Back;        
+
+    VertexShader = DebugLightZVS();
+    PixelShader = DebugLightZPS();
+  }
+}

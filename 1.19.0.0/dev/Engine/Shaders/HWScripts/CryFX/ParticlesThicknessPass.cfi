@@ -1,0 +1,238 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Source File.
+//  Shader extension
+//  Copyright (C), Crytek Studios, 2001-2012.
+// -------------------------------------------------------------------------
+//  File name:   ParticlesThicknessPass.cfi
+//  Version:     v1.00
+//  Refactored:  01/05/12 by Tiago Sousa
+//  Compilers:  
+//  Description: Screen space thickness approximation pass
+//
+////////////////////////////////////////////////////////////////////////////
+
+
+struct OutputThicknessVS
+{
+#if %_PS
+  float4 WPos	:	SV_POSITION;
+#else
+  #if %_VS && %_RT_NO_TESSELLATION && !%_HS || %_DS || !FEATURE_PARTICLES_TESSELLATION
+    float4 HPosition  : POSITION; // output HPosition only if no tessellation or if Domain shader
+  #endif
+#endif
+		
+
+  float4 baseTC     : TEXCOORDN;
+
+#if %_RT_ANIM_BLEND
+  float3 blendTC   : TEXCOORDN;
+#endif
+
+#if %_VS && !%_RT_NO_TESSELLATION || %_HS || FEATURE_PARTICLES_TESSELLATION
+ float4 vWorldPos : TEXCOORDN;
+#endif
+    
+ #ifndef SIMPLE_PARTICLE
+  half4 vNormal   : TEXCOORDN;
+#endif
+
+  float4 Color     : COLOR0;
+};
+
+///////////////// vertex shaders //////////////////
+
+OutputThicknessVS UnifyParticleThicknessInputs(in SParticleVertex pCommon)
+{
+  OutputThicknessVS OUT = (OutputThicknessVS) 0;
+
+  OUT.baseTC.xy = pCommon.baseTC;
+#if %_RT_ANIM_BLEND
+  OUT.blendTC = pCommon.blendTC; 
+#endif
+
+#if FEATURE_PARTICLES_TESSELLATION && !%_RT_NO_TESSELLATION
+  OUT.vWorldPos.xyz = pCommon.vWorldPos;
+	OUT.vWorldPos.w = pCommon.SHBasis0.z;  // temporary workaround constant buffers troubles, pass constant through interpolator
+#else
+  OUT.HPosition = pCommon.HPosition;
+#endif
+
+  //OUT.Color = ParticleOut.Color;
+  OUT.Color = 1;//pCommon.Color.w;
+  OUT.Color.w = pCommon.baseTC.w;
+
+#ifndef SIMPLE_PARTICLE
+
+  OUT.vNormal  = pCommon.vNormal;
+
+  // Apply alpha scale
+  OUT.Color.w *= ParticleParams.x;
+#endif
+
+  //float4 Color    : COLOR0;
+
+  return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+OutputThicknessVS ParticleThicknessVS(app2vertParticleGeneral IN)
+{
+  SParticleVertex pCommon = ParticleCommonVertexOutput(IN, 0);
+  return UnifyParticleThicknessInputs(pCommon);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// DX11 specifics
+
+struct ControlPointThicknessHS
+{  
+  float4 baseTC          : TEXCOORDN;
+#if %_RT_ANIM_BLEND
+  float3 blendTC         : TEXCOORDN;
+#endif
+
+  float4 vWorldPos       : TEXCOORDN;
+
+#ifndef SIMPLE_PARTICLE
+  half4 vNormal   : TEXCOORDN;
+#endif
+
+  float4 Color           : COLOR0;
+};
+
+TessFactorsHS ParticleThicknessConstFuncHS(InputPatch<OutputThicknessVS, 4> p, uint PatchID : SV_PrimitiveID )
+{
+  float4 vWP[4] = { p[0].vWorldPos, p[1].vWorldPos, p[2].vWorldPos, p[3].vWorldPos };
+  return ParticleCommonConstFuncHS( vWP, p[0].vWorldPos.w );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+[domain("quad")]
+[partitioning("fractional_even")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(4)]
+[patchconstantfunc("ParticleThicknessConstFuncHS")]
+[maxtessfactor(16)]
+ControlPointThicknessHS ParticleThicknessHS(InputPatch<OutputThicknessVS, 4> inputPatch, uint uCPID : SV_OutputControlPointID)
+{
+  ControlPointThicknessHS OUT = (ControlPointThicknessHS)0;
+
+  OUT.baseTC = inputPatch[uCPID].baseTC;
+#if %_RT_ANIM_BLEND
+  OUT.blendTC = inputPatch[uCPID].blendTC;
+#endif
+
+  OUT.vWorldPos = inputPatch[uCPID].vWorldPos;
+  OUT.Color = inputPatch[uCPID].Color;
+
+#ifndef SIMPLE_PARTICLE
+  OUT.vNormal  = inputPatch[uCPID].vNormal;
+#endif
+
+  return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+[domain("quad")]
+OutputThicknessVS ParticleThicknessDS(float2 BarycentricCoords : SV_DomainLocation, const OutputPatch<ControlPointThicknessHS, 4> ControlPt, TessFactorsHS TessFactorsInput)
+{
+  OutputThicknessVS OUT = (OutputThicknessVS)0;
+
+  float4 vWorldPos = BilinearInterp(BarycentricCoords, ControlPt[0].vWorldPos, ControlPt[1].vWorldPos, ControlPt[2].vWorldPos, ControlPt[3].vWorldPos);
+  OUT.HPosition = mul(PerView_ViewProjMatr, float4(vWorldPos.xyz, 1));
+
+  OUT.baseTC = BilinearInterp(BarycentricCoords, ControlPt[0].baseTC, ControlPt[1].baseTC, ControlPt[2].baseTC, ControlPt[3].baseTC);
+#if %_RT_ANIM_BLEND
+  OUT.blendTC = BilinearInterp(BarycentricCoords, ControlPt[0].blendTC.xyzz, ControlPt[1].blendTC.xyzz, ControlPt[2].blendTC.xyzz, ControlPt[3].blendTC.xyzz);
+#endif
+
+  OUT.Color = BilinearInterp(BarycentricCoords, ControlPt[0].Color, ControlPt[1].Color, ControlPt[2].Color, ControlPt[3].Color);
+
+#ifndef SIMPLE_PARTICLE
+  OUT.vNormal = BilinearInterp(BarycentricCoords, ControlPt[0].vNormal, ControlPt[1].vNormal, ControlPt[2].vNormal, ControlPt[3].vNormal);
+#endif
+
+  return OUT;
+}
+
+///////////////// pixel shaders //////////////////
+pixout ParticleThicknessPS(OutputThicknessVS IN)
+{
+  pixout OUT = (pixout)0;  
+  half4 cDiffuseMap = GetTexture2D(diffuseSampler, IN.baseTC.xy);
+#if %_RT_ANIM_BLEND
+  // Blend in second tile
+  half4 cDiffuseMapSec = GetTexture2D(diffuseSampler, IN.blendTC.xy);
+  cDiffuseMap += (cDiffuseMapSec - cDiffuseMap) * IN.blendTC.z;
+#endif
+
+  cDiffuseMap *= saturate(IN.Color);
+
+  float4 tcScreen = GetScreenCoords( IN.WPos );
+
+	// reminder: expose alpha scale
+	float fAlpha = min( saturate(cDiffuseMap.w) , saturate( dot( cDiffuseMap.xyz, 0.333) ) );
+
+  half fRecipTransmittanceScaleRT = 4.0;//0.5; //1.0 / 2.0;
+  half4 cFinal = saturate( sqrt( fAlpha* fRecipTransmittanceScaleRT) );
+
+#ifndef SIMPLE_PARTICLE
+  IN.vNormal.xyz = normalize( IN.vNormal.xyz ); // todo fetch particle normal map for Particle.cfx
+  cFinal.xyz = (IN.vNormal.xyz) * 0.5+0.5;
+  cFinal.xyz *= cFinal.w; // pre-multiplied alpha
+#endif
+
+
+#if %_RT_SOFT_PARTICLE
+      //ApplySoftIntersection( cFinal, tcScreen, IN.baseTC.z);
+#endif
+
+  OUT.Color = cFinal;
+
+  return OUT;
+}
+
+technique ThicknessPassDX11
+{
+  pass p0
+  {
+    VertexShader = ParticleThicknessVS() ParticleVS;
+    HullShader   = ParticleThicknessHS() ParticleHS;
+    DomainShader = ParticleThicknessDS() ParticleDS;    
+    PixelShader = ParticleThicknessPS() ParticlePS;
+
+
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+
+    SrcBlend = ONE;
+    DestBlend = ONE_MINUS_SRC_ALPHA;
+    AlphaBlendEnable = true;
+
+    IgnoreMaterialState = true;
+  }
+}
+
+technique ThicknessPass
+{
+  pass p0
+  {
+    VertexShader = ParticleThicknessVS() ParticleVS;
+    PixelShader = ParticleThicknessPS() ParticlePS;
+
+    ZEnable = false;
+    ZWriteEnable = false;
+    CullMode = None;
+
+    SrcBlend = ONE;
+    DestBlend = ONE_MINUS_SRC_ALPHA;
+    AlphaBlendEnable = true;
+
+    IgnoreMaterialState = true;
+  }
+}

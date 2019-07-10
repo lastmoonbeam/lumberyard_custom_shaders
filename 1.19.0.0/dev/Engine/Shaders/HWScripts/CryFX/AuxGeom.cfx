@@ -1,0 +1,116 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "common.cfi"
+
+
+// Uniform data
+float4x4 matViewProj;
+float4x4 matWorldViewProj;
+
+float4 auxGeomObjColor;
+float3 globalLightLocal;
+float2 auxGeomObjShading;
+
+
+// Structure of vertex shader input for geometries
+struct SAuxGeomApp2VS
+{
+	float4 pos : POSITION;
+	float2 tex : TEXCOORD0; // unused but needs to be declared under DX10 to be able to share signatures
+	float4 col : COLOR0;
+};
+
+
+// Structure of vertex shader input for objects
+struct SAuxGeomObjApp2VS
+{
+	float4 pos : POSITION;
+	float3 normal : TEXCOORD0;
+};
+
+
+// Structure of vertex shader output = pixel shader input
+struct SAuxVS2PS
+{
+	float4 pos : POSITION;
+	float4 col : COLOR0;
+};
+
+
+// Default vertex shader to transform auxiliary 3D geometries
+SAuxVS2PS
+AuxGeomVS( SAuxGeomApp2VS IN )
+{
+    SAuxVS2PS OUT = (SAuxVS2PS) 0;
+    OUT.pos = mul( matViewProj, IN.pos );
+    OUT.col = GetInputColor( IN.col );
+
+    // If we are using jittered rendering, we need to depth-bias auxiliary geometry
+    // in order to avoid z-fighting with each jittered sample. Auxiliary geometry renders
+    // after TAA, which means we're depth-testing against a jittered depth. This bias helps
+    // alleviate strobing artifacts.
+    float JitteredDepthBias = 0.001;
+    if (PerView_JitterParams.x == 0.0 && PerView_JitterParams.y == 0.0)
+    {
+        JitteredDepthBias = 0.0;
+    }
+    OUT.pos.z += JitteredDepthBias;
+    return OUT;
+}
+
+
+// Default vertex shader to transform auxiliary 3D geometry objects
+SAuxVS2PS
+AuxGeomObjVS( SAuxGeomObjApp2VS IN )
+{
+  SAuxVS2PS OUT = (SAuxVS2PS) 0;
+
+  OUT.pos = mul( matWorldViewProj, IN.pos );
+  
+  float shading = dot( IN.normal, globalLightLocal );
+  shading = auxGeomObjShading.x * shading + auxGeomObjShading.y;
+  OUT.col = float4( auxGeomObjColor.rgb * shading, auxGeomObjColor.a );
+
+  return OUT;
+}
+
+
+// Default pixel shader to render auxiliary 2D/3D geometries and geometry objects
+float4
+AuxGeomPS( SAuxVS2PS IN ) : COLOR0
+{
+  return IN.col;
+}
+
+
+// Default technique for auxiliary geometry rendering
+technique AuxGeometry
+{
+  pass p0
+  {
+    VertexShader = AuxGeomVS();
+    PixelShader = AuxGeomPS();
+  }
+}
+
+
+// Default technique for auxiliary geometry objects rendering
+technique AuxGeometryObj
+{
+  pass p0
+  {
+    VertexShader = AuxGeomObjVS();
+    PixelShader = AuxGeomPS();
+  }
+}

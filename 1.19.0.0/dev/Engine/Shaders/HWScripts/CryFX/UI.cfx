@@ -1,0 +1,304 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+
+// We are passing these values through using SetColorOp but this shader has different meanings for the values
+#define CO_NORMAL 1
+#define CO_PRE_MULTIPLY_ALPHA 2
+
+#define AO_NORMAL 1
+#define AO_MODULATE_ALPHA 2
+#define AO_MODULATE_ALPHA_AND_COLOR 3
+
+/// Un-Tweakables //////////////////////
+float4x4 compMatrix  : PI_Composite  < register = c0; >; // View*Projection
+
+Texture2D<float4> uiTex0 : register(t0);
+Texture2D<float4> uiTex1 : register(t1);
+Texture2D<float4> uiTex2 : register(t2);
+Texture2D<float4> uiTex3 : register(t3);
+Texture2D<float4> uiTex4 : register(t4);
+Texture2D<float4> uiTex5 : register(t5);
+Texture2D<float4> uiTex6 : register(t6);
+Texture2D<float4> uiTex7 : register(t7);
+Texture2D<float4> uiTex8 : register(t8);
+Texture2D<float4> uiTex9 : register(t9);
+Texture2D<float4> uiTex10 : register(t10);
+Texture2D<float4> uiTex11 : register(t11);
+Texture2D<float4> uiTex12 : register(t12);
+Texture2D<float4> uiTex13 : register(t13);
+Texture2D<float4> uiTex14 : register(t14);
+Texture2D<float4> uiTex15 : register(t15);
+
+// We use a separate sampler for each texture. This is the way the renderer is set up to work when you use
+// SetTexture with a texture stage. It also allows us to combine wrap and clamp samplers in the same draw call.
+
+SamplerState uiSampler0 : register(s0);
+SamplerState uiSampler1 : register(s1);
+SamplerState uiSampler2 : register(s2);
+SamplerState uiSampler3 : register(s3);
+SamplerState uiSampler4 : register(s4);
+SamplerState uiSampler5 : register(s5);
+SamplerState uiSampler6 : register(s6);
+SamplerState uiSampler7 : register(s7);
+SamplerState uiSampler8 : register(s8);
+SamplerState uiSampler9 : register(s9);
+SamplerState uiSampler10 : register(s10);
+SamplerState uiSampler11 : register(s11);
+SamplerState uiSampler12 : register(s12);
+SamplerState uiSampler13 : register(s13);
+SamplerState uiSampler14 : register(s14);
+SamplerState uiSampler15 : register(s15);
+
+half4 sampleTriangleTexture(int texIndex, float2 uv)
+{
+ // since we always use lod0 is there a faster version of Sample?
+#if METAL
+ // Switch statements are not supported in cross compiler for Metal, so use if/else instead
+ if (texIndex == 0)
+ {
+  return uiTex0.Sample(uiSampler0, uv);
+ }
+ else if (texIndex == 1)
+ {
+  return uiTex1.Sample(uiSampler1, uv);
+ }
+ else if (texIndex == 2)
+ {
+  return uiTex2.Sample(uiSampler2, uv);
+ }
+ else if (texIndex == 3)
+ {
+  return uiTex3.Sample(uiSampler3, uv);
+ }
+ else if (texIndex == 4)
+ {
+  return uiTex4.Sample(uiSampler4, uv);
+ }
+ else if (texIndex == 5)
+ {
+  return uiTex5.Sample(uiSampler5, uv);
+ }
+ else if (texIndex == 6)
+ {
+  return uiTex6.Sample(uiSampler6, uv);
+ }
+ else if (texIndex == 7)
+ {
+  return uiTex7.Sample(uiSampler7, uv);
+ }
+ else if (texIndex == 8)
+ {
+  return uiTex8.Sample(uiSampler8, uv);
+ }
+ else if (texIndex == 9)
+ {
+  return uiTex9.Sample(uiSampler9, uv);
+ }
+ else if (texIndex == 10)
+ {
+  return uiTex10.Sample(uiSampler10, uv);
+ }
+ else if (texIndex == 11)
+ {
+  return uiTex11.Sample(uiSampler11, uv);
+ }
+ else if (texIndex == 12)
+ {
+  return uiTex12.Sample(uiSampler12, uv);
+ }
+ else if (texIndex == 13)
+ {
+  return uiTex13.Sample(uiSampler13, uv);
+ }
+ else if (texIndex == 14)
+ {
+  return uiTex14.Sample(uiSampler14, uv);
+ }
+ else if (texIndex == 15)
+ {
+  return uiTex15.Sample(uiSampler15, uv);
+ }
+#else
+ switch(texIndex)
+ {
+  case 0:
+   return uiTex0.Sample(uiSampler0, uv);
+  case 1:
+   return uiTex1.Sample(uiSampler1, uv);
+  case 2:
+   return uiTex2.Sample(uiSampler2, uv);
+  case 3:
+   return uiTex3.Sample(uiSampler3, uv);
+  case 4:
+   return uiTex4.Sample(uiSampler4, uv);
+  case 5:
+   return uiTex5.Sample(uiSampler5, uv);
+  case 6:
+   return uiTex6.Sample(uiSampler6, uv);
+  case 7:
+   return uiTex7.Sample(uiSampler7, uv);
+  case 8:
+   return uiTex8.Sample(uiSampler8, uv);
+  case 9:
+   return uiTex9.Sample(uiSampler9, uv);
+  case 10:
+   return uiTex10.Sample(uiSampler10, uv);
+  case 11:
+   return uiTex11.Sample(uiSampler11, uv);
+  case 12:
+   return uiTex12.Sample(uiSampler12, uv);
+  case 13:
+   return uiTex13.Sample(uiSampler13, uv);
+  case 14:
+   return uiTex14.Sample(uiSampler14, uv);
+  case 15:
+   return uiTex15.Sample(uiSampler15, uv);
+ }
+#endif
+
+ return half4(0,0,0,0);
+}
+
+/////////////////////////////
+
+struct a2v
+{
+  float4 Position : POSITION; //in object space
+  float2 baseTC   : TEXCOORD0;
+  float4 Color    : COLOR0;
+  uint2  Flags    : BLENDINDICES;
+};
+
+struct v2f
+{
+  float4 Position  : POSITION;  //in projection space
+#if %_FT_DIFFUSE
+  float4 Color     : COLOR0;
+#endif  
+#if %_FT_TEXTURE
+  float2 baseTC    : TEXCOORD0;
+  nointerpolation uint texIndex : COLOR1;
+  nointerpolation uint texHasColorChannel : COLOR2;
+  nointerpolation uint texIndex2 : COLOR3;
+#endif  
+};
+
+///////////////// vertex shader //////////////////
+v2f FPVS(a2v IN)
+{
+  v2f OUT = (v2f)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.Position = mul(compMatrix, vPos);
+  OUT.Position.z = IN.Position.z;
+  
+#if %_FT_TEXTURE
+  OUT.baseTC = IN.baseTC;
+  OUT.texIndex = IN.Flags.x & 0x00FF;
+  OUT.texHasColorChannel = ((IN.Flags.x & 0xFF00) > 0) ? 1 : 0;
+  OUT.texIndex2 = IN.Flags.y & 0x00FF;
+#endif  
+#if %_FT_DIFFUSE
+  OUT.Color = GetInputColor(IN.Color);
+#endif  
+
+  return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+pixout FPPS(v2f IN)
+{
+  pixout OUT;
+
+  // load the base
+  half4 baseTex = (float4)0; 
+  half4 INDiffuse = (float4)0;
+  
+#if %_FT_TEXTURE
+  baseTex = sampleTriangleTexture(IN.texIndex, IN.baseTC.xy);
+#endif  
+
+#if %_FT_DIFFUSE
+  INDiffuse = IN.Color;
+#endif
+
+  half4 resColor = (half4)0;
+  baseTex.xyz = (IN.texHasColorChannel) ? baseTex.xyz : float3(1.0f, 1.0f, 1.0f);
+  resColor = baseTex * INDiffuse;
+
+#if %_RT_ALPHATEST
+  clip(resColor.w - 0.5h);
+#endif
+
+//Should use srgb anytime after tonemapping
+#if %_FT_SRGBWRITE
+  resColor.xyz = LinearToSRGB(resColor.xyz);
+#endif
+
+  // Check for flag to premultiply alpha - we set the CO flags through SetColorOp
+  if (%_FT0_COP == CO_PRE_MULTIPLY_ALPHA)
+  {
+    // premultiply the color by the alpha. This would not be required if we had full access to the separate alpha blend mode
+    half4 preMult = resColor.w;
+    resColor.xyz *= preMult;
+  }
+  
+#if %_FT_TEXTURE
+  if (%_FT0_AOP == AO_MODULATE_ALPHA)
+  {
+    half4 maskTex = sampleTriangleTexture(IN.texIndex2, IN.baseTC.xy);
+    resColor.w *= maskTex.w;
+
+#if %_RT_ALPHATEST
+    // This is a rare case that would only happen if a gradient mask is used inside the mask primitive for a stencil mask
+    clip(resColor.w - 0.5h);
+#endif
+  }
+  else if (%_FT0_AOP == AO_MODULATE_ALPHA_AND_COLOR)
+  {
+    half4 maskTex = sampleTriangleTexture(IN.texIndex2, IN.baseTC.xy);
+    resColor *= maskTex.w;
+
+#if %_RT_ALPHATEST
+    // This is a rare case that would only happen if a gradient mask is used inside the mask primitive for a stencil mask
+    clip(resColor.w - 0.5h);
+#endif
+  }
+#endif  
+
+  OUT.Color = resColor;
+
+  return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique FixedPipeline
+{
+  pass p0
+  {
+    VertexShader = FPVS();
+    
+    ZEnable = true;
+    ZWriteEnable = true;
+    CullMode = None;
+    
+    PixelShader = FPPS();
+  }
+}
+
+/////////////////////// eof ///

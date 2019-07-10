@@ -1,0 +1,70 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script = "ShaderDrawType = Custom;";
+>;
+
+float4x4 CompMatrix  : PI_Composite < vsregister = c0; >;
+
+struct a2v
+{
+  float4 Position : POSITION; 
+  float2 baseTC   : TEXCOORD0;
+  IN_C0
+};
+
+struct v2f
+{
+  float4 Position  : POSITION;
+};
+
+///////////////// vertex shader //////////////////
+
+v2f OcclusionTestVS(a2v IN)
+{
+  v2f OUT = (v2f)0; 
+  OUT.Position = mul(CompMatrix, IN.Position);
+  return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+pixout OcclusionTestPS(v2f IN)
+{
+  pixout OUT = (pixout ) 0;
+  OUT.Color = half4(4,0,0,1);
+  return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique General
+{
+  pass p0
+  {
+    VertexShader = OcclusionTestVS();
+    PixelShader = OcclusionTestPS();
+    
+    ZEnable = true;
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+
+/////////////////////// eof ///

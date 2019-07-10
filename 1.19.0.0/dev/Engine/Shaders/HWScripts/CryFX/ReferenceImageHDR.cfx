@@ -1,0 +1,57 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+//------------------------------------------------------------------------------
+// This shader presents an image before all post-processing hence it can be used 
+// as a reference image for textures before adding the post effects.
+// The final result will contain all post effects and match other compared 
+// objects that have the post effects applied.
+// Usage: An artist might want to compare a texture to the result for any given object.
+//------------------------------------------------------------------------------
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "vertexLib.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+    "Public;"
+    "ForceTransPass;"
+    "ShaderType = General;"
+    "ShaderDrawType = General;"
+    "ForceDrawLast;"
+>;
+
+vert2FragGeneral
+DebugLightVS( app2vertGeneral IN )
+{
+    vert2FragGeneral OUT = (vert2FragGeneral) 0;
+
+    streamPos vertPassPos = (streamPos)0;
+    vs_shared_output(IN, OUT, vertPassPos, false);
+    return OUT;
+}
+
+float4 DebugLightPS( in vert2FragGeneral IN ) : COLOR
+{
+    float4 color = GetTexture2D( diffuseMapSampler, IN.baseTC );
+    color.rgb += GetMaterial_Emittance();
+    return color;
+}
+
+technique General
+{
+    pass p0
+    {
+        VertexShader = DebugLightVS();
+        PixelShader = DebugLightPS();
+    }
+}

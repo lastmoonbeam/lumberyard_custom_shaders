@@ -1,0 +1,441 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "PostEffectsLib.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = PostProcess;"
+>; 
+
+half4 g_RainVolumeParams < psregister = c0; >;
+half4 g_RainColorMultipliers < psregister = c1; >;
+float4 g_WorldViewPos < psregister = c3; >;
+float4 g_RainPuddleParams0 < psregister = c4; >;
+float4 g_RainPuddleParams1 < psregister = c5; >;
+float4 g_RainOcc_WindOffs < psregister = c8; >;
+float4x4 g_RainOcc_TransMat < psregister = c9; >;
+
+sampler2D surfaceFlowMap : register(s0) = sampler_state
+{
+	Texture = Textures/Rain/surface_flow_ddn.dds;
+	MinFilter = LINEAR;
+	MagFilter = LINEAR;
+	MipFilter = LINEAR; 
+	AddressU = Wrap;
+	AddressV = Wrap;
+};
+
+#ifdef %ST_FIXED_POINT
+Texture2D <uint> sceneDepthMapSampler : TS_ZTarget;
+#else
+sampler2D sceneDepthMapSampler : register(s1) = sampler_state
+{
+  Texture = $ZTarget;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+#endif
+
+sampler2D rainOccMap : register(s4) = sampler_state
+{
+  Texture = $RainOcclusion;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Border;
+  AddressV = Border;
+	BorderColor = {1,1,1,1};
+};
+
+sampler2D rainRipplesMap : register(s5) = sampler_state
+{
+  Texture = Textures/Rain/Ripple/ripple#01_24_ddn.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+sampler2D rainSpatterMap : register(s6) = sampler_state
+{
+  Texture = Textures/Rain/rain_spatter.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+sampler2D puddleMaskMap : register(s7) = sampler_state
+{
+  Texture = Textures/Rain/puddle_mask.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = LINEAR; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half3 GetWorldPos( half fDepth, half3 vCamVec )
+{
+	return fDepth * vCamVec + g_WorldViewPos.xyz;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+vtxOutWPOS DeferredRainVS(vtxInWPOS IN)
+{
+  vtxOutWPOS OUT = (vtxOutWPOS)0;
+
+  float4 vPos = IN.Position;
+
+  vPos.y = 1 - vPos.y;
+  OUT.HPosition = float4(vPos.xy*2-1, vPos.z, 1.0);
+  OUT.baseTC = HPosToScreenTC(OUT.HPosition);
+  OUT.baseTC.zw = OUT.baseTC.xy/PerView_HPosScale.xy;
+  OUT.CamVec.xyz = IN.CamVec.xyz;
+
+  return OUT;
+}
+
+
+#define SPLASH_NORMAL_THRESH	0.01h
+#define SPLASH_NORMAL_STR			0.3h
+#define SPLASH_GLOSS_STR			0.5h
+#define SPATTER_SCALE_SMALL		0.8h
+
+#define BIT_STENCIL_STATIC 0x80
+Texture2D<uint2> DeferredRainGBuffer_StencilTex : register(t12);
+
+#if GMEM
+struct pixoutRainGBuffer
+{
+	half4 Normal   : GBufferAslot;
+	half4 Diffuse  : COLOR1;
+	half4 Specular : COLOR2;
+// Check if we are linearizing the depth/stencil in the ZPass
+#if LinDepthResStenSlot
+	half2 LinDepthResSten : LinDepthResStenSlot;
+#endif
+
+};
+#else
+struct pixoutRainGBuffer
+{
+	half4 Normal   : COLOR0;
+	half4 Specular : COLOR1;
+	half4 Diffuse  : COLOR2;
+};
+#endif
+pixoutRainGBuffer DeferredRainGBufferImpl( vtxOutWPOS IN, const bool bDoDiscard )
+{
+#if GMEM
+    	pixoutRainGBuffer OUT;
+    	float fDepth = GmemGetLinearDepth(sceneDepthMapSampler, IN.baseTC.xy, true);
+#else
+	pixoutRainGBuffer OUT = (pixoutRainGBuffer) 0;	
+	const half fDepth = GetLinearDepth(sceneDepthMapSampler, IN.baseTC.xy);
+#endif
+	const float3 vPosition = GetWorldPos(fDepth, IN.CamVec);
+	
+#if GMEM
+	half4 bufferA = GMEM_NormalRT.Load(int3(0,0,0));
+	half4 bufferB = GMEM_DiffuseRT.Load(int3(0,0,0));
+	half4 bufferC = GMEM_SpecularRT.Load(int3(0,0,0));
+	MaterialAttribsCommon attribs = DecodeGBuffer(bufferA, bufferB, bufferC);
+#else
+	MaterialAttribsCommon attribs = DecodeGBuffer( tex2D( _tex9, IN.baseTC.xy ), tex2D( _texB, IN.baseTC.xy ), tex2D( _texA, IN.baseTC.xy ) );
+#endif
+
+	///////////////////////////////////////////////////////////////////////////////////////////////////////
+	// World-space masking
+	
+	half puddleMask = max(g_RainPuddleParams1.x, tex2D(puddleMaskMap, vPosition.xy * 0.1h).x);
+	half spatterMaskSmall = tex2D(rainSpatterMap, vPosition.xy * 0.7h).x;
+	half spatterMaskLarge = tex2D(rainSpatterMap, vPosition.xy * 0.3h).x;
+	
+	half spatterMask = spatterMaskSmall + spatterMaskLarge;	
+	
+	///////////////////////////////////////////////////////////////////////////////////////////////////////
+	// Volume attenuation
+	
+	const half fDistAttenuation = saturate( GetAttenuation(g_RainVolumeParams.xyz - vPosition.xyz, g_RainVolumeParams.w) );
+	half fAttenuation = fDistAttenuation * saturate(10.f + g_RainColorMultipliers.w * fDepth);
+
+	// Rain occlusion wrt/ rain direction
+#if %_RT_SAMPLE0
+	half3 vOccMapCoords = mul((float3x4)g_RainOcc_TransMat, float4(vPosition, 1.f));
+	vOccMapCoords.y = 1.h - vOccMapCoords.y;
+	vOccMapCoords.xy += spatterMask * (2.h/RAIN_OCC_MAP_SIZE) - (1.h/RAIN_OCC_MAP_SIZE);
+
+	half2 vOccDepth;
+	vOccDepth.x = tex2D(rainOccMap, vOccMapCoords.xy).x;
+	vOccDepth.y = tex2D(rainOccMap, vOccMapCoords.xy + g_RainOcc_WindOffs.xy).x;
+	
+	half2 bOccCheck = (vOccDepth==1.0f) ? 1.h : (254.h/256.h - vOccDepth) < vOccMapCoords.z;
+	fAttenuation *= lerp(bOccCheck.x, bOccCheck.y, 0.5h);
+#else
+	fAttenuation *= saturate(vPosition.z - (PerFrame_WaterLevel.x - 0.5h));
+#endif
+	
+	//////////////////////////////////////////////////////////////////////////////////////////////////
+	// Horizontal surface puddles
+	
+	const half isUpSurface = saturate(attribs.NormalWorld.z * 5.h - 4.h);
+	const half fPuddlesBlendAmount = g_RainPuddleParams0.z * isUpSurface;
+	const half fPuddleStrength = saturate(fPuddlesBlendAmount * (puddleMask * 0.5h + 0.5h));
+	
+	int3 vPixCoord = int3(IN.baseTC.xy / PerView_HPosScale.xy * PS_ScreenSize.xy, 0);
+##if AZ_RESTRICTED_PLATFORM
+    ##include_restricted(DeferredRain_cfx, AZ_RESTRICTED_PLATFORM)
+##endif
+##if AZ_RESTRICTED_SECTION_IMPLEMENTED
+    ##undef AZ_RESTRICTED_SECTION_IMPLEMENTED
+##else
+    #if GMEM
+        const uint nStencilID = GmemGetStencilValue(DeferredRainGBuffer_StencilTex, vPixCoord.xy, true);
+	const half isDynamicObject = (nStencilID & BIT_STENCIL_STATIC) == 0 ? 1 : 0;
+    #else
+        const half isDynamicObject = (DeferredRainGBuffer_StencilTex.Load(vPixCoord).g & BIT_STENCIL_STATIC) == 0 ? 1 : 0;
+    #endif
+##endif
+
+	if ( bDoDiscard && (fAttenuation < 0.001 || fPuddlesBlendAmount < 0.001))
+	{
+		discard;
+ 	}
+
+	// Ripples
+	const half fPuddleEdge = saturate(puddleMask * 16.h - 4.h) * fAttenuation * (1 - isDynamicObject);
+	half2 vPuddles = GetXYNormalMap(rainRipplesMap, vPosition.xy + g_RainPuddleParams0.xy);
+	attribs.NormalWorld.xy = lerp(attribs.NormalWorld.xy, vPuddles * g_RainPuddleParams0.z * g_RainPuddleParams1.y, saturate(fPuddlesBlendAmount * fPuddleEdge));
+	
+	// Adjust albedo
+	half porosity = saturate( ((1 - attribs.Smoothness) - 0.5) / 0.3 );
+	attribs.Albedo *= lerp( 1, lerp(1, 0.2, saturate(porosity * g_RainPuddleParams0.w)), fPuddleStrength * fAttenuation );
+
+	// Adjust smoothness
+	half fGlossWet = lerp( attribs.Smoothness, lerp(0.85, 0.60, porosity), fPuddleStrength * fAttenuation );
+	attribs.Smoothness = lerp( fGlossWet, 0.93, fPuddleEdge * fPuddleStrength );
+	
+	///////////////////////////////////////////////////////////////////////////////////////////////////////
+	// Puddle splashes
+
+#if %_RT_SAMPLE1
+	// Use increased tiling on dynamic objects
+	if (isDynamicObject) spatterMaskLarge = tex2D(rainSpatterMap, vPosition.xy * 5).x;
+	
+	// Threshold spatter animation
+	half spatterMaskAnim = frac(spatterMask + spatterMaskLarge + PerView_AnimGenParams.z);
+	half splash = spatterMaskAnim * step(0.45h, spatterMaskSmall);
+	
+	//const float wetnessSplashThresh = 0.99f;
+	//const float wetnessSplashStr = 0.5f;
+	//splash = max(splash, step(wetnessSplashThresh, surfaceWetness) * wetnessSplashStr);
+
+	const half3 vViewVec = g_WorldViewPos.xyz - vPosition.xyz;	
+	const half fViewVecLen = length(vViewVec);
+	
+	// Far & near distance fades
+	half splashFade = saturate(fViewVecLen * 0.01h);
+	splashFade = splashFade - splashFade * saturate(fViewVecLen * 0.085h);
+	
+	// Increase splashes in puddle areas
+	splashFade = saturate(splashFade * (1.f + 0.5f * fPuddleStrength));
+
+	// Threshold spatter mask
+	const half splashThreshold = saturate(splash * 20.h - 18.h);
+	splash = splashThreshold * splashFade;
+	splash *= g_RainPuddleParams1.z * isUpSurface * fAttenuation;
+	
+	 // Make splashes more visible on dynamic objects
+	splash *= lerp(1, 5, isDynamicObject);
+	
+	// Splashes alter gloss and surface lightness
+	attribs.Albedo = lerp(attribs.Albedo, 0.7h, splash);
+	attribs.Smoothness += splash * SPLASH_GLOSS_STR;
+	
+	// Apply random surface noise
+	half2 surfaceNoise = GetXYNormalMap(surfaceFlowMap, vPosition.xy * SPATTER_SCALE_SMALL);
+	attribs.NormalWorld.xy += step(SPLASH_NORMAL_THRESH, splash) * surfaceNoise * SPLASH_NORMAL_STR;
+#endif
+	
+	EncodeGBuffer( attribs, OUT.Normal, OUT.Diffuse, OUT.Specular, true);
+
+	return OUT;
+}
+
+[earlydepthstencil]
+pixoutRainGBuffer DeferredRainGBufferPS( vtxOutWPOS IN )
+{
+    return DeferredRainGBufferImpl(IN, true);
+}
+
+[earlydepthstencil]
+pixoutRainGBuffer DeferredRainGBufferNoDiscardPS( vtxOutWPOS IN )
+{
+    return DeferredRainGBufferImpl(IN, false);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if GMEM
+void DeferredRainGBufferStencilPS( vtxOutWPOS IN )
+{
+
+    float fDepth = GmemGetLinearDepth(sceneDepthMapSampler, IN.baseTC.xy, true);
+    const float3 vPosition = GetWorldPos(fDepth, IN.CamVec);
+
+    half4 bufferA = GMEM_NormalRT.Load(int3(0,0,0));
+    half4 bufferB = GMEM_DiffuseRT.Load(int3(0,0,0));
+    half4 bufferC = GMEM_SpecularRT.Load(int3(0,0,0));
+    MaterialAttribsCommon attribs = DecodeGBuffer(bufferA, bufferB, bufferC);
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////
+    // World-space masking
+
+    half puddleMask = max(g_RainPuddleParams1.x, tex2D(puddleMaskMap, vPosition.xy * 0.1h).x);
+    half spatterMaskSmall = tex2D(rainSpatterMap, vPosition.xy * 0.7h).x;
+    half spatterMaskLarge = tex2D(rainSpatterMap, vPosition.xy * 0.3h).x;
+
+    half spatterMask = spatterMaskSmall + spatterMaskLarge;
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Volume attenuation
+
+    const half fDistAttenuation = saturate( GetAttenuation(g_RainVolumeParams.xyz - vPosition.xyz, g_RainVolumeParams.w) );
+    half fAttenuation = fDistAttenuation * saturate(10.f + g_RainColorMultipliers.w * fDepth);
+
+    // Rain occlusion wrt/ rain direction
+    #if %_RT_SAMPLE0
+    half3 vOccMapCoords = mul((float3x4)g_RainOcc_TransMat, float4(vPosition, 1.f));
+    vOccMapCoords.y = 1.h - vOccMapCoords.y;
+    vOccMapCoords.xy += spatterMask * (2.h/RAIN_OCC_MAP_SIZE) - (1.h/RAIN_OCC_MAP_SIZE);
+
+    half2 vOccDepth;
+    vOccDepth.x = tex2D(rainOccMap, vOccMapCoords.xy).x;
+    vOccDepth.y = tex2D(rainOccMap, vOccMapCoords.xy + g_RainOcc_WindOffs.xy).x;
+
+    half2 bOccCheck = (vOccDepth==1.0f) ? 1.h : (254.h/256.h - vOccDepth) < vOccMapCoords.z;
+    fAttenuation *= lerp(bOccCheck.x, bOccCheck.y, 0.5h);
+    #else
+    fAttenuation *= saturate(vPosition.z - (PerFrame_WaterLevel.x - 0.5h));
+    #endif
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // Horizontal surface puddles
+
+    const half isUpSurface = saturate(attribs.NormalWorld.z * 5.h - 4.h);
+    const half fPuddlesBlendAmount = g_RainPuddleParams0.z * isUpSurface;
+
+    if (fAttenuation < 0.001 || fPuddlesBlendAmount < 0.001)
+    {
+        discard;
+    }
+
+    return;
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct app2vertOcc
+{
+  IN_P
+	IN_TBASE
+	IN_C0
+};
+
+struct vert2fragOcc
+{
+  OUT_P
+	float Z : TEXCOORD0;
+};
+
+vert2fragOcc DeferredRainOccVS( app2vertOcc IN )
+{
+	vert2fragOcc OUT = (vert2fragOcc)0;
+	OUT.HPosition = half4(mul((float3x4)g_RainOcc_TransMat, IN.Position), 1);
+	OUT.HPosition.z = 1 - OUT.HPosition.z;
+	OUT.Z = OUT.HPosition.z;
+	return OUT;
+}
+
+pixout DeferredRainOccPS( vert2fragOcc IN )
+{
+	pixout OUT = (pixout)0;
+	OUT.Color = min(IN.Z, 254.0f/255.0f);
+	return OUT;
+}
+
+
+//////////////////////////////// technique ////////////////
+
+#if GMEM
+technique DeferredRainGBufferStencil
+{
+	pass p0
+	{
+		VertexShader = DeferredRainVS();
+		PixelShader = DeferredRainGBufferStencilPS() DeferredRainPS;
+		CullMode = None;
+	}
+}
+#endif
+
+technique DeferredRainGBuffer
+{
+	pass p0
+	{
+		VertexShader = DeferredRainVS();
+		PixelShader = DeferredRainGBufferPS() DeferredRainPS;
+		CullMode = None;
+	}
+}
+
+technique DeferredRainGBufferNoDiscard
+{
+	pass p0
+	{
+		VertexShader = DeferredRainVS();
+		PixelShader = DeferredRainGBufferNoDiscardPS() DeferredRainPS;
+		CullMode = None;
+	}
+}
+
+technique RainOcclusion
+{
+	pass p0
+	{
+		VertexShader = DeferredRainOccVS();
+		PixelShader = DeferredRainOccPS();
+	}
+}

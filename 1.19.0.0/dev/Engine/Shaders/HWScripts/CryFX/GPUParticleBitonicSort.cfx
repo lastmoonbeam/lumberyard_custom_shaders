@@ -1,0 +1,58 @@
+#include "GPUParticle.cfi"
+#include "GPUParticleHelpers.cfi"
+
+float4 Parameters;                                              // j, k, maxParticles, BufferOffset
+RWStructuredBuffer<uint2> ParticleSortIndices : register(u0);   // per-particle data
+
+void swap(inout uint2 x, inout uint2 y)
+{
+    uint2 temp = x;
+    x = y;
+    y = temp;
+}
+
+[numthreads(256, 1, 1)]
+void CS(
+    uint3 GroupId : SV_GroupID,
+    uint3 DispatchThreadId : SV_DispatchThreadID,
+    uint3 GroupThreadId : SV_GroupThreadID,
+    uint GroupIndex: SV_GroupIndex)
+{
+    // get parameters and convert to uint
+    uint j = Parameters.x;
+    uint k = Parameters.y;
+    uint maxParticles = Parameters.z;
+    int bufferOffset = asint(Parameters.w);
+    
+    // get virtual index
+    uint vi = DispatchThreadId.x;
+    
+    // calculate first index
+    uint i = vi + (vi & (~(j-1)));
+    
+    // calculate second index
+    uint ixj = i + j;
+    
+    // check if out of bounds, if so, skip iteration
+    [branch]
+    if(ixj<maxParticles || i<maxParticles)
+    {
+        uint directionMin = j * clamp(i&k,0,1);
+        uint directionPlus = j * (1-clamp(i&k,0,1));
+        
+        [branch]
+        if(ParticleSortIndices[i+directionMin + bufferOffset].y > ParticleSortIndices[i+directionPlus + bufferOffset].y)
+        {
+            swap(ParticleSortIndices[i+directionMin + bufferOffset], ParticleSortIndices[i+directionPlus + bufferOffset]);
+        }
+    }
+}
+
+// Default technique
+technique Default
+{
+    pass p0
+    {
+        ComputeShader = CS();
+    }
+}

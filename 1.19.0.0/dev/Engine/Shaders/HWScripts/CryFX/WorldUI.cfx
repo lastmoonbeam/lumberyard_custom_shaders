@@ -1,0 +1,265 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "IllumValidations.cfi"
+#include "Common.cfi"
+
+// Shader global descriptions
+float Script: STANDARDSGLOBAL
+<
+string Script =
+    "Public;"
+#if %VERTCOLORS
+        "VertexColors"
+#endif
+    "SupportsDeferredShading;"
+    "SupportsFullDeferredShading;"
+    "SupportsAttrInstancing;"
+    "ShaderDrawType = Light;"
+    "ShaderType = General;"
+    >;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// Custom shading pass structure /////////////////////////////////////
+struct fragPassCustom
+{
+};
+
+struct fragLightPassCustom
+{
+};
+
+sampler2D emittanceMapSampler
+{
+    string UIName = "Emittance";
+    string UIDescription = "Multiplies the emissive color with RGB texture. Emissive alpha mask is contained in alpha channel.";
+    Texture = $Emittance;
+};
+
+#include "ShadeLib.cfi"
+
+// Tweakables /////////////////
+half EmittanceMapGamma
+<
+register = PER_MATERIAL_0.x;
+string UIWidget = "slider";
+string UIName = "Emittance Map Gamma";
+string UIHelp = "Expands the lower range of the emittance map causing darker colors to appear less bright";
+float UIMin = 1.0;
+float UIMax = 2.0;
+float UIStep = 0.1;
+> = 1.0;
+
+
+//=========================================================================
+
+#include "VertexLib.cfi"
+
+//=======================================================================
+//  Lighting
+//=======================================================================
+
+///////////////// light vertex shader //////////////////
+
+vert2FragGeneral WorldUIVS(app2vertGeneral IN)
+{
+    vert2FragGeneral OUT = (vert2FragGeneral)0;
+
+    streamPos vertPassPos = (streamPos)0;
+    vs_shared_output(IN, OUT, vertPassPos, true);
+
+    return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_unify_parameters(inout fragPass pPass)
+{
+    pPass.bRenormalizeNormal = true;
+    pPass.bDeferredSpecularShading = true;
+
+    #if %VERTCOLORS
+        pPass.bVertexColors = true;
+    #endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_begin(inout fragPass pPass)
+{
+    float4 baseTC = pPass.IN.baseTC;
+    float4 bumpTC = pPass.IN.bumpTC;
+
+    // load the diffuse texture
+    pPass.cDiffuseMap *= PerMaterial_DiffuseColor;	// Main layer albedo/tint color + alpha
+
+    pPass.cSpecularMap *= PerMaterial_SpecularColor;
+
+    pPass.fGloss *= GetTexture2D(smoothnessMapSampler, baseTC.xy).r;
+
+    // Output alpha
+    half fAlpha = pPass.cDiffuseMap.a;
+    if (pPass.bVertexColors)
+    {
+        fAlpha *= pPass.IN.Color.a;
+    }
+
+    pPass.fAlpha = fAlpha * pPass.IN.Ambient.w;
+
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_per_light(inout fragPass pPass, inout fragLightPass pLight)
+{
+    pLight.fNdotL = saturate(pLight.fNdotL);
+
+    half    fRoughness =  SmoothnessToRoughness(pPass.fGloss, MIN_ROUGHNESS );
+    half3   cDiffuse = pLight.cDiffuse.xyz * DiffuseBRDF(fRoughness, pPass.vNormal.xyz, pPass.vView, pLight.vLight, pLight.fNdotL);
+    half3   cSpecular = pLight.cSpecular.xyz * SpecularBRDF(fRoughness, pPass.vNormal, pPass.vView, pLight.vLight, pPass.cSpecularMap.rgb, 1.0) * pLight.fNdotL;
+    half3   cK = pLight.fOcclShadow * pLight.fFallOff * pLight.cFilter;
+
+    pPass.cDiffuseAcc.xyz += cDiffuse.xyz * cK.xyz;
+    pPass.cSpecularAcc.xyz += cSpecular.xyz * cK.xyz;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// the input cAmbient used here is derived by the pPass.IN.Ambient which is set 
+// to 1.0 by default and so it clearly doesn't represnt energy measure.
+// The following cheap math makes sure that at least it is reduced accordng to the sun
+// energy.
+// Notice that the following function doesn't apply if Forward Tiled Lighting is used.
+//------------------------------------------------------------------------------
+void frag_custom_ambient(inout fragPass pPass, inout half3 cAmbient)
+{
+    const half precisionTH = 0.99h;       // (1 - epsilon) because comparison to 1.0 will fail.
+    if (dot(cAmbient.xyz, cAmbient.xyz) > precisionTH)
+    {
+        const half  nightLuminance = 0.01h;
+        half        sunAttenuation = lerp(nightLuminance, 1.0, NoonToNightRatio );
+        cAmbient.xyz *= sunAttenuation;
+    }
+    pPass.cAmbientAcc.xyz += cAmbient.xyz;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void frag_custom_end(inout fragPass pPass, inout half3 cFinal)
+{
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "fragLib.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+sampler2D emissiveIntensitySampler
+{
+    string UIName = "Emittance Multiplier";
+    string UIDescription = "Multiplies the emissive color with RGB texture";
+    Texture = $DecalOverlay;
+};
+
+half3 GetEmittance(fragPass pPass)
+{
+#if %EMITTANCE_MAP
+    float4 emittanceMap = GetTexture2D(emittanceMapSampler, pPass.IN.emittanceTC);
+    float4 emissiveIntensityMap = GetTexture2D(emissiveIntensitySampler, pPass.IN.emissiveIntensityTC.xy);
+#else
+    float4 emittanceMap = float4(1.0, 1.0, 1.0, 1.0);
+    float4 emissiveIntensityMap = float4(.5, .5, .5, .5);
+#endif
+
+    // Increase the range of non-HDR textures:
+    //   AdjustLuminance(emittanceMap.rgb, pow(GetLuminance(emittanceMap.rgb), Gamma));
+    emittanceMap.rgb *= pow(max(GetLuminance(emittanceMap.rgb), 1e-6), EmittanceMapGamma - 1);
+    emittanceMap.rgb *= emissiveIntensityMap.rgb;
+
+    // DEPRECATED: Just for backwards compatibility (up to 3.8.3)
+    emittanceMap.rgb *= emittanceMap.a;
+
+    return GetMaterial_Emittance().xyz * emittanceMap.rgb;
+}
+
+//////////////////////////////////////////////////////////////////////
+
+EARLYDEPTHSTENCIL
+pixout WorldUIPS(vert2FragGeneral IN)
+{
+    pixout OUT = (pixout)0;
+    fragPass pPass = (fragPass) 0;
+
+    frag_unify(pPass, IN);
+
+    half4 cFinal = frag_shared_output(pPass);
+
+    half3 emittance = half3(0, 0, 0);
+    const bool bEmissive = GetLuminance(PerMaterial_EmissiveColor.xyz) > 0;
+    if (bEmissive)
+    {
+        emittance = GetEmittance(pPass);
+    }
+
+    cFinal.rgb += emittance;
+
+    HDROutput(OUT, cFinal, 1);
+    DepthFixupOutput(OUT.Color, cFinal.a, IN.WPos);
+
+    return OUT;
+}
+
+#include "IllumTess.cfi"
+
+//////////////////////////////// technique ////////////////
+
+technique General
+<
+string Script =
+    "TechniqueZ=ZPass;"
+    >
+{
+    pass p0
+    {
+        VertexShader = WorldUIVS() GeneralVS;
+        PixelShader = WorldUIPS() GeneralPS;
+
+        ZEnable = false;
+        ZWriteEnable = false;
+        ZFunc = Always;
+
+        CullMode = Back;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "CommonZPass.cfi"
+#include "CommonMotionBlurPass.cfi"
+#include "CommonViewsPass.cfi"
+#include "ShadowCommon.cfi"
+#include "CommonShadowGenPass.cfi"
+#include "CommonDebugPass.cfi"
+#if PCDX11 || GL4 || GLES3 || METAL
+    #include "MeshBaker.cfi"
+#endif
+
+/////////////////////// eof ///

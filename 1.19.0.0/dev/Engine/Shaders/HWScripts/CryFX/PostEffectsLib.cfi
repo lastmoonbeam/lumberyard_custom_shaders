@@ -1,0 +1,329 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Source File.
+//  Shader extension
+//  Copyright (C), Crytek Studios, 2001-2004.
+// -------------------------------------------------------------------------
+//  File name:   PostEffectsLib.cfi
+//  Version:     v1.00
+//  Created:     13/06/2006 by Tiago Sousa
+//  Compilers:   
+//  Description: Common post-process utilities library
+//
+//  Todo: Clean stuff up
+//
+// -------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////
+
+//////////////////////////////// Common constants ////////////////
+
+// Common vertex and pixel shader params 
+//    - use for explicitly setting values from code
+
+float4 vsParams[16] < register = c0; >;
+float4 psParams[16] < register = c50; >;
+
+float4   RotGridScreenOffset : PB_RotGridScreenOff;
+
+float4  ScrSize : PB_ScreenSize;
+
+float4  g_vQuadParams;
+float4  g_vQuadPosParams;
+float4  g_vViewFrustumLT;
+float4  g_vViewFrustumLB;
+float4  g_vViewFrustumRT;
+float4  g_vViewFrustumRB;
+
+// x, y, z - unused, w - particle lifetime
+float4  vScrParticleInfo;
+	
+#define RAIN_OCC_MAP_SIZE 256
+#define WATER_RIPPLES_SIM_GRID_SIZE 25
+
+//////////////////////////////// Common samplers ////////////////
+
+#ifdef %ST_FIXED_POINT
+
+Texture2D <uint> _tex0_depth : register(t0);
+Texture2D <uint> _tex1_depth : register(t1);
+Texture2D <uint> _tex2_depth : register(t2);
+Texture2D <uint> _tex3_depth : register(t3);
+Texture2D <uint> _tex5_depth : register(t5);
+
+#else
+
+sampler2D _tex0_depth : register(s0);
+sampler2D _tex1_depth : register(s1);
+sampler2D _tex2_depth : register(s2);
+sampler2D _tex3_depth : register(s3);
+sampler2D _tex5_depth : register(s5);
+#endif
+
+// Use when explicitly binding from code (_tex to void name colision)
+sampler2D _tex0 : register(s0);
+sampler2D _tex1 : register(s1);
+sampler2D _tex2 : register(s2);
+sampler2D _tex3 : register(s3);
+sampler2D _tex4 : register(s4);
+sampler2D _tex5 : register(s5);
+sampler2D _tex6 : register(s6);
+sampler2D _tex7 : register(s7);
+sampler2D _tex8 : register(s8);
+sampler2D _tex9 : register(s9);
+sampler2D _texA : register(s10);
+sampler2D _texB : register(s11);
+sampler2D _texC : register(s12);
+sampler2D _texD : register(s13);
+sampler2D _texE : register(s14);
+sampler2D _texF : register(s15);
+
+// Transforms for the textures above. Originally float2x4 [16]
+// but that didn't play nice with apple compilers, so replaced
+// it with float4 [16 * 2] and introduced helper functions.
+float4 g_texTransforms[16 * 2];
+
+SamplerState _smp0_D3D11 : register(s0);
+
+Texture2D<float4> _tex0_D3D11 : register(t0);
+Texture2D<float4> _tex3_D3D11 : register(t3);
+
+samplerCUBE _cubetex0 : register(s0);
+samplerCUBE _cubetex1 : register(s1);
+samplerCUBE _cubetex2 : register(s2);
+samplerCUBE _cubetex3 : register(s3);
+samplerCUBE _cubetex4 : register(s4);
+samplerCUBE _cubetex5 : register(s5);
+samplerCUBE _cubetex6 : register(s6);
+samplerCUBE _cubetex7 : register(s7);
+
+// Use for auto binding
+sampler2D screenMapSampler : register (s0)
+{
+  Texture = $BackBuffer;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+
+#ifdef %ST_FIXED_POINT
+Texture2D <uint> sceneDepthSampler : TS_ZTarget;
+#else
+sampler2D depthMapSampler  : register (s1)
+{
+  Texture = $ZTarget;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+#endif
+
+sampler2D screenMapScaledSampler_d2  : register (s2)
+{
+  Texture = $BackBufferScaled_d2;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+
+sampler2D screenMapScaledSampler_d4  : register (s3)
+{
+  Texture = $BackBufferScaled_d4;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+
+sampler2D screenMapScaledSampler_d8  : register (s4)
+{
+  Texture = $BackBufferScaled_d8;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+
+sampler2D screenTargetSampler : register (s0)
+{
+  Texture = $SceneTarget;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT; 
+  AddressU = Clamp;
+  AddressV = Clamp;	
+};
+
+//////////////////////////////// Common vertex shader stuff ////////////////
+
+struct pixout_MRT
+{
+  float4 Color  : COLOR0;
+  float4 Color1 : COLOR1;
+};
+
+struct vtxIn
+{
+  IN_P
+  IN_TBASE
+	IN_C0
+};
+
+struct vtxInWPOS
+{
+  IN_P
+  IN_TBASE
+  float3 CamVec : TEXCOORD1;
+};
+
+struct vtxOut
+{
+  OUT_HPOS_IN_WPOS
+  float4 baseTC     : TEXCOORD0;
+};
+
+struct vtxOutWPOS
+{
+  float4 HPosition   : POSITION;
+  float4 baseTC      : TEXCOORD0;
+  float4 CamVec      : TEXCOORD1;
+};
+
+float4 GetHPositionFsQuad(float4 vPos)
+{
+	vPos.x = (vPos.x)? g_vQuadPosParams.z : g_vQuadPosParams.x;
+	vPos.y = (vPos.y)? g_vQuadPosParams.w : g_vQuadPosParams.y;
+	vPos.z = g_vQuadParams.z;
+	return  Get2dHPos(vPos);
+}
+
+float3 GetCamVecFsQuad(float4 vPos)
+{
+	float3 vCamVecLerpT = (vPos.x)? g_vViewFrustumRT : g_vViewFrustumLT;
+	float3 vCamVecLerpB = (vPos.x)? g_vViewFrustumRB : g_vViewFrustumLB;	
+	return (vPos.y)? vCamVecLerpB : vCamVecLerpT;
+}
+
+///////////////// vertex shader //////////////////
+
+// Quad output (via static quad)
+vtxOut FsQuadVS(vtxIn IN)
+{
+	vtxOut OUT = (vtxOut) 0; 
+	OUT.HPosition = GetHPositionFsQuad(IN.Position);
+	OUT.baseTC.xy = IN.baseTC.xy;
+	return OUT;
+}
+
+vtxOutWPOS FsQuadCamVecVS(vtxIn IN)
+{
+	vtxOutWPOS OUT = (vtxOutWPOS) 0;
+	OUT.HPosition = GetHPositionFsQuad(IN.Position);
+	OUT.CamVec.xyz = GetCamVecFsQuad(IN.Position);
+	OUT.baseTC.xy = IN.baseTC.xy;
+	return OUT;
+}
+
+// deprecated, can be removed once all dependent techniques updated to use DrawQuadFS from cpp
+vtxOut BaseVS(vtxIn IN)
+{
+  vtxOut OUT = (vtxOut)0; 
+	OUT.HPosition = Get2dHPos(IN.Position);  
+  OUT.baseTC.xy = IN.baseTC.xy;
+
+  // output with correct aspect ratio into wz
+  OUT.baseTC.wz = (IN.baseTC.xy -0.5 ) * float2(0.75*(ScrSize.x/ScrSize.y), 1.0) + 0.5;
+  return OUT;
+}
+
+// deprecated
+vtxOut CustomViewPortBaseVS(vtxIn IN)
+{
+  vtxOut OUT = (vtxOut)0; 
+
+  float4 vPos = IN.Position;
+  OUT.HPosition = mul(vpMatrix, vPos);  
+  OUT.baseTC.xy = IN.baseTC.xy;
+
+  // output with correct aspect ratio into wz
+  OUT.baseTC.wz = (IN.baseTC.xy -0.5 ) * float2(0.75*(ScrSize.x/ScrSize.y), 1.0) + 0.5;
+
+  return OUT;
+}
+
+// deprecated
+vtxOutWPOS BaseWPOSVS(vtxInWPOS IN)
+{
+  vtxOutWPOS OUT = (vtxOutWPOS)0; 
+  OUT.HPosition = Get2dHPos(IN.Position);
+  OUT.baseTC.xy = IN.baseTC.xy;
+  OUT.CamVec.xyz = IN.CamVec;
+  return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float4 getTexTransformX(uint slot)
+{
+    return g_texTransforms[slot * 2];
+}
+
+float4 getTexTransformY(uint slot)
+{
+    return g_texTransforms[slot * 2 + 1];
+}
+
+float getTextureMip(uint slot)
+{
+    // Mip is stored in the w channel of the texture transform
+    return getTexTransformX(slot).w;
+}
+
+float2 transformTexCoord(float2 inCoord, uint slot)
+{
+    float2 outputCoord;
+    outputCoord.x = dot(float3(inCoord.xy, 1), getTexTransformX(slot).xyz);
+    outputCoord.y = dot(float3(inCoord.xy, 1), getTexTransformY(slot).xyz);
+    return outputCoord;
+}
+
+// Color grading/charts tex lookup
+void TexColorChart2D(in sampler2D chartSampler, inout half3 cImage)
+{
+	const float chartDim	= 16.0;
+	const float3 scale = float3(chartDim - 1.0, chartDim - 1.0, chartDim - 1.0) / chartDim;
+	const float3 bias = float3(0.5, 0.5, 0.0) / chartDim;
+
+	//cImage = float3(0.5, 1.0, 4.0 / chartDim); // debug lookup color to test addressing of "unwrapped" chart slices
+	
+	float3 lookup = saturate(cImage) * scale + bias;
+	
+	// convert input color into 2d color chart lookup address 
+	float slice = lookup.z * chartDim;	
+	float sliceFrac = frac(slice);	
+	float sliceIdx = slice - sliceFrac;
+	
+	lookup.x = (lookup.x + sliceIdx) / chartDim;
+	
+ 	// lookup adjacent slices
+ 	float3 col0 = tex2D(chartSampler, lookup.xy); 	
+ 	lookup.x += 1.0 / chartDim;
+ 	float3 col1 = tex2D(chartSampler, lookup.xy);
+
+	// linearly blend between slices 	 	
+	cImage = col0 + (col1 - col0) * sliceFrac;
+ 	//cImage = sliceFrac;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////// eof ///

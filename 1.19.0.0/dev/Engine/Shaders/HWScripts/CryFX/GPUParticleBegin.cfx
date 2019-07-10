@@ -1,0 +1,22 @@
+
+RWStructuredBuffer<int> ParticleState : register(u0);   // per-emitter frame data
+
+float4 ClearInfo;   // .x count
+
+[numthreads(256, 1, 1)]                                   
+void CS( uint3 DispatchThreadId : SV_DispatchThreadID)                     
+{
+    if(DispatchThreadId.x < asuint(ClearInfo.x))
+    {
+        ParticleState[DispatchThreadId.x] = 0;
+    }
+}
+
+// Default technique
+technique Default
+{
+    pass p0
+    {
+        ComputeShader = CS();
+    }
+}

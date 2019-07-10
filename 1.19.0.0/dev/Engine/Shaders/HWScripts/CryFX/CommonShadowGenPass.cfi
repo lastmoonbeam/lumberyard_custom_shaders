@@ -1,0 +1,232 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+
+sampler2D noiseSamplerSG = sampler_state
+{
+  Texture = EngineAssets/Textures/noise.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT; 
+  AddressU = Wrap;
+  AddressV = Wrap;
+};
+
+///////////////// vertex shader //////////////////
+v2f_sh Common_SG_VS(app2vertSGGeneral IN_common)
+{
+  v2f_sh OUT = (v2f_sh)0; 
+
+  	app2vertSGGeneral IN = IN_common;
+#if %TEMP_TERRAIN
+	IN.vertCommon.Position.z = IN_common.vertCommon.baseTC.x;
+#endif
+
+  streamPos vertPassPos = (streamPos)0;
+  streamPos_FromSG(IN, vertPassPos);
+
+  float4 HPosition = Pos_VS_Shadow(PerView_ViewProjMatr, vertPassPos);
+
+#if %SPEEDTREE_BILLBOARD
+  half3 worldTangentN = normalize(mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2]));
+  SpeedTreeRemoveBillboardFace(worldTangentN.xyz, vertPassPos.ObjToTangentSpace[2].z > 0.5, OUT.HPosition);
+#endif
+
+#if ((ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION) || ((!ENABLE_TESSELLATION || %_RT_NO_TESSELLATION) && %_RT_SAMPLE4))
+  // Preparing the inverse non-uniform matrix for correct vector transform
+  float3x3    instInvScaleMat = InverseScaleMatrixFast((const float3x3)vertPassPos.InstMatrix);
+#endif 
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+	// For shadow gen this is world position (not relative to camera)
+	OUT.vView.xyz = vertPassPos.WorldPos.xyz;
+
+    // Inverse scale should be applied here tohandle non-uniform scaling of vecotrs
+    OUT.vNormal.xyz = normalize(mul(instInvScaleMat, vertPassPos.Normal));
+#endif
+
+	// RSMs
+#if (!ENABLE_TESSELLATION || %_RT_NO_TESSELLATION) && %_RT_SAMPLE4
+	#if %_RT_DECAL_TEXGEN_2D
+		// tex gen for 2d projected decals
+		OUT.baseTC.x = dot( DecalTangent.xyz, vertPassPos.Position.xyz );
+		OUT.baseTC.y = dot( DecalBinormal.xyz, vertPassPos.Position.xyz );
+
+        // Center UVs since vertPassPos.Position is relative to the decal's center
+        OUT.baseTC.xy += 0.5f;  
+	#elif %TEMP_TERRAIN
+		// tex coordinates on the sector textures
+		OUT.baseTC.x = dot(float4(0, BaseTCMatrix[0], 0, BaseTCMatrix[1]), vertPassPos.WorldPos);
+		OUT.baseTC.y = dot(float4(BaseTCMatrix[0], 0, 0, BaseTCMatrix[2]), vertPassPos.WorldPos);
+		OUT.Normal = vertPassPos.Normal;
+	#else 
+		float3 objSpaceNormal = TangNormalUnnormalized(vertPassPos.Tangent, vertPassPos.Binormal);
+		OUT.Normal = mul(instInvScaleMat, objSpaceNormal);
+
+		// Apply texture modifiers
+		float4 baseTC = vertPassPos.baseTC;
+		_ModifyUV_1(baseTC, baseTC, vertPassPos.Position );
+		OUT.baseTC = baseTC.xy;
+	#endif
+	OUT.Depth2 = HPosition.zw;
+#endif
+
+#if !%_RT_CUBEMAP0 
+  #if !%_RT_NEAREST
+		HPosition.z /= PerShadow_FrustumInfo.y;	//use linear z-buffer
+
+	#if %TEMP_TERRAIN
+		HPosition.z *= 1.005f;
+		HPosition.z += .001;
+		HPosition.z = max(HPosition.z, 0.001);
+	#endif
+
+  #endif
+  #if !%_RT_HW_PCF_COMPARE
+    //perspective interpolation is not needed here
+    OUT.Depth = HPosition.z - PerShadow_FrustumInfo.z; //increase precision around camera
+  #endif
+  #if !%_RT_NEAREST
+		HPosition.z *= HPosition.w;   //HPosition.z is linearized already
+  #endif
+#else
+    OUT.Depth = (HPosition.z/PerShadow_FrustumInfo.y);
+    OUT.Depth += fDepthTestBias.x;
+//_RT_DIRECTLIGHT
+#endif
+
+float4 OutBaseTC;
+#if !%TEMP_TERRAIN
+ #if %_RT_ALPHATEST || %_RT_ALPHABLEND || %_RT_DISSOLVE
+	_ModifyUV_1(vertPassPos.baseTC, OutBaseTC, vertPassPos.Position );
+	OUT.baseTC.xy = OutBaseTC;
+ #endif
+#endif
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+	_ModifyUV_1(vertPassPos.baseTC, OutBaseTC, vertPassPos.Position );
+	OUT.baseTC.xy = OutBaseTC;
+#endif
+
+#if %_DS || %_PS || !ENABLE_TESSELLATION || %_RT_NO_TESSELLATION
+  OUT.HPosition = HPosition;
+#endif  
+
+  return OUT;
+}
+
+// Hull shader and domain shader
+#include "CommonShadowGenPassTess.cfi"
+//////////////////////////////////////
+
+// Indirect color 
+float4 IndirectColor
+<
+  register = PER_MATERIAL_11;
+  string UIHelp = "Tints the bounce light from global illumination"; 
+  string UIWidget = "color";
+  string UIName = "Indirect bounce color";
+> = {0.25, 0.25, 0.25, 0.25};
+
+struct pixout_shadow
+{
+  float4 Color  : COLOR0;
+#if %_RT_SAMPLE4
+  half4 Normal	 : COLOR1;
+	float4 Depth2  : COLOR2;
+#endif
+#if %_RT_HW_PCF_COMPARE && %_RT_CUBEMAP0
+	float Depth		: SV_Depth;
+#endif
+};
+
+///////////////// pixel shader //////////////////
+pixout_shadow Common_SG_PS(v2f_sh IN)
+{
+	pixout_shadow OUT;
+	OUT.Color = half4(0,0,0,0);
+
+#if !%_RT_HW_PCF_COMPARE
+	OUT.Color.rgba = IN.Depth; //FIX: depth output should be here for precision
+#else
+	#if %_RT_CUBEMAP0
+		//output linear depth
+
+		float depth = IN.Depth;
+		float depthDiffX = abs(ddx(depth));
+		float depthDiffY = abs(ddy(depth));
+		float maxDepthDiff = max(depthDiffX, depthDiffY);
+
+		const float depthSlopeBias = PerShadow_BiasInfo.x;
+		depth += maxDepthDiff * depthSlopeBias;
+		
+		OUT.Depth = depth;
+	#endif
+#endif
+
+#if (!ENABLE_TESSELLATION || %_RT_NO_TESSELLATION) && %_RT_SAMPLE4
+	OUT.Depth2 = IN.Depth2.x / IN.Depth2.y;
+	OUT.Normal.xyz = normalize(half3(IN.Normal.xyz))*.5h+.5h;
+	OUT.Normal.w = 1;
+#endif
+
+#if %_RT_ALPHATEST || %_RT_ALPHABLEND || %_RT_SAMPLE4
+	#if !%TEMP_TERRAIN
+		half4 baseColor = GetTexture2D(diffuseMapSampler, IN.baseTC.xy);
+	#else
+		half4 baseColor = GetTerrainTex(baseMapSampler, IN.baseTC.xy);
+	#endif
+
+	clip(baseColor.a - GetMaterial_AlphaTest());
+
+	#if (!ENABLE_TESSELLATION || %_RT_NO_TESSELLATION) && %_RT_SAMPLE4
+		// output RSM color component
+		#if !%TEMP_TERRAIN
+			half3 vFinalIndirectColor = PerMaterial_DiffuseColor.rgb * IndirectColor.rgb * 4.h; 
+			OUT.Color.rgb = baseColor.rgb * vFinalIndirectColor;
+		#else
+			OUT.Color.rgb = baseColor.rgb;
+		#endif
+		OUT.Color.a = baseColor.a * GetInstance_Opacity();
+	#endif
+#endif
+
+#if %_RT_DISSOLVE
+     		half fNoise = tex2D(noiseSamplerSG, IN.baseTC.xy*6.h).x ;
+#endif
+	return OUT;
+}
+
+//======================================================================
+
+technique ShadowGen
+{
+	pass p0
+	{
+		VertexShader = Common_SG_VS() ShadowGenVS;
+#if ENABLE_TESSELLATION
+		HullShader   = Common_ShadowGenHS() ShadowGenVS;
+		DomainShader = Common_ShadowGenDS() ShadowGenVS;
+#endif
+
+		ZEnable = true;
+		ZWriteEnable = true;
+		CullMode = Back;
+
+		PixelShader = Common_SG_PS() ShadowGenPS;
+
+    #if %GRASS || %LEAVES || %HAIR_PASS || %TEMP_SKIN
+      CullMode = None;
+    #endif
+  }
+}

@@ -1,0 +1,11 @@
+
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script = 
+           "Public;"
+           "ShaderDrawType = NoDraw;";
+>;
+
+/////////////////////// eof ///

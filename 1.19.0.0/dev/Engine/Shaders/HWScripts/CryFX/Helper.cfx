@@ -1,0 +1,96 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ModificatorVT.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "ShaderDrawType = General;"
+>;
+
+/// Un-Tweakables //////////////////////
+float4 ObjColor  : PI_AmbientOpacity;
+
+sampler2D TexSampler = sampler_state
+{
+  Texture = $Diffuse;
+};
+
+/////////////////////////////
+
+struct a2v
+{
+  float4 Position : POSITION; //in object space
+  float2 Tex0     : TEXCOORD0;
+  float4 Color    : COLOR0;
+  //float3 Normal : NORMAL; //in object space
+
+	float4 Tangent  : TANGENT;
+	float4 Binormal : BINORMAL;
+};
+
+struct v2f
+{
+  float4 Position  : POSITION;  //in projection space
+  float3 Normal  : COLOR;  //Normal
+};
+
+///////////////// vertex shader //////////////////
+v2f HelperVS(a2v IN)
+{
+  v2f OUT = (v2f)0; 
+
+  // Position in screen space.
+  float4 vPos = IN.Position;
+  OUT.Position = _pos_Common(vPos);
+  
+  OUT.Normal = normalize( (cross(IN.Tangent.xyz, IN.Binormal.xyz)) * IN.Tangent.w );
+
+  return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+pixout HelperPS(v2f IN)
+{
+  pixout OUT;
+  
+  // load the base
+  float3 LightVec = normalize( float3(1,1,1) );
+  float cosa = 0.2 + max( 0.2,dot( IN.Normal,LightVec ) );
+  OUT.Color.a = ObjColor.a;
+  OUT.Color.xyz = ObjColor.xyz * cosa;
+
+  return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique General
+{
+  pass p0
+  {
+    VertexShader = HelperVS();
+    
+    ZEnable = true;
+    ZWriteEnable = true;
+    CullMode = Back;
+    
+    PixelShader = HelperPS();
+  }
+}
+
+/////////////////////// eof ///

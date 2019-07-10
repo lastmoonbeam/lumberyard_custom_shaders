@@ -1,0 +1,143 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+
+/*
+* This file handles two passes for fur:
+*   1) Obliterate, which executes after deferred shading, to remove fur stipples from shading output
+*       - The lighting output from the adjacent pixel is written to the stippled pixel (i.e., 1px horizontal blur)
+*       - Depth buffer is written using linear depth buffer capture before fur stipples were drawn
+*   2) Shell Prepass, which gathers all data required for shell passes and packs into a single buffer:
+*       - Diffuse lighting accumulation, with volumetric fog applied if enabled
+*       - Specular lighting accumulation, with volumetric fog applied if enabled
+*       - Scene depth
+*/
+
+#include "CommonViewsPass.cfi"
+#include "PostEffectsLib.cfi"
+
+struct vert2FragFurObliterate
+{
+    OUT_HPOS_IN_WPOS
+    float4 screenProj : TEXCOORDN;
+};
+
+vert2FragFurObliterate Fur_Obliterate_PassVS(app2vertCommon IN)
+{
+    vert2FragFurObliterate OUT = (vert2FragFurObliterate)0;
+
+    streamPos vertPassPos = (streamPos)0;
+    vertPassPos.CustomData.bPrevPass = false;
+    vertPassPos.CustomData.shellDistance = 1;
+    #if %FUR_VERT_COLORS
+        vertPassPos.CustomData.vFurCombWorld = IN.Color.xyz;
+        vertPassPos.CustomData.furLengthScale = IN.Color.w;
+    #endif
+
+    streamPos_FromCommon(IN, vertPassPos);
+    OUT.HPosition = Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos);
+    OUT.screenProj = HPosToScreenTC(OUT.HPosition);
+
+    return OUT;
+}
+
+struct pixoutFurObliterate
+{
+    float4 Color : COLOR0;
+    float Depth : SV_Depth;
+};
+
+pixoutFurObliterate Fur_Obliterate_PassPS(vert2FragFurObliterate IN)
+{
+    // Discard pixels to make a 1 in 4 stipple pattern
+    float2 pixelCoord = floor(IN.WPos.xy); // Drop pixel center offset
+    clip( any(frac(pixelCoord * 0.5f)) ? -1.0f : 1.0f ); // If either x/y is odd, clip the frag
+
+    pixoutFurObliterate OUT = (pixoutFurObliterate)0;
+
+    float2 tcScreen = IN.screenProj.xy / IN.screenProj.ww;
+
+    // Retrieve depth from Z target before stipples were rendered, convert back from linear to perspective depth, and write out
+    OUT.Depth = GetDeviceDepthH(_tex1_depth, tcScreen);
+
+    // Read color from adjacent pixels. Average the pixels to the right and below to get a smoother blend on edges
+    float4 colorSamples = tex2D(_tex0, tcScreen + float2(PS_ScreenSize.z * 2, 0));
+    colorSamples += tex2D(_tex0, tcScreen + float2(0, PS_ScreenSize.w * 2));
+    OUT.Color = colorSamples * 0.5;
+
+    clip(IN.WPos.z - OUT.Depth + 0.005);
+
+    return OUT;
+}
+
+technique FurObliterate
+{
+    pass p0
+    {
+        VertexShader = Fur_Obliterate_PassVS();
+        PixelShader = Fur_Obliterate_PassPS();
+
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = Back;
+        AlphaBlendEnable = false;
+
+        // Need to use Always to allow further away depth writes to happen. Occlusion by closer objects handled by clip in PS
+        ZFunc = Always;
+    }
+}
+
+struct pixoutFurShell
+{
+##if AZ_RESTRICTED_PLATFORM
+    ##include_restricted(FurObliteratePass_cfi, AZ_RESTRICTED_PLATFORM)
+##endif
+    float4 Color : COLOR0;
+};
+
+pixoutFurShell FurShellPrepassPS(vtxOutWPOS IN)
+{
+    float3 diffuseAcc = tex2D(_tex1, IN.baseTC.xy).rgb;
+    float3 finalShading = tex2D(_tex0, IN.baseTC.xy).rgb;
+    float depth = tex2D(_tex5_depth, IN.baseTC.xy).r;
+
+    MaterialAttribsCommon attribs = DecodeGBuffer(tex2D(_tex3, IN.baseTC.xy), tex2D(_tex2, IN.baseTC.xy), tex2D(_tex4, IN.baseTC.xy));
+    float3 albedo = attribs.Albedo;
+    albedo *= saturate(1 - GetLuminance(attribs.Reflectance)); // Simple energy conservation between specular and diffuse
+
+    float3 specularAcc = finalShading - diffuseAcc * albedo;
+
+#if %_RT_VOLUMETRIC_FOG
+    float sceneDepth = depth * PerView_NearFarClipDist.y;
+    VolumetricFogTexcoord vtc = GetVolumetricFogTexcoordParamByScreenTexcoordAndDepth(IN.baseTC.xy, sceneDepth);
+    float4 volumetricFog = GetVolumetricFogValue(vtc);
+    half4 globalFogColor = GetVolumetricFogAnalyticalColor(normalize(IN.CamVec.xyz), sceneDepth);
+
+    // Applying volumetric fog here is separable: apply transmittance only to diffuse; apply transmittance and color to specular
+    ApplyVolumetricFog(volumetricFog, globalFogColor, vtc, specularAcc);
+    diffuseAcc *= volumetricFog.w; // volumetricFog was already blended with global fog and clamped by ApplyVolumetricFog on previous line
+#endif
+
+    pixoutFurShell OUT = (pixoutFurShell)0;
+    OUT.Color = EncodeFurShellLighting(diffuseAcc, specularAcc, depth);
+    return OUT;
+}
+
+technique FurShellPrepass
+{
+    pass p0
+    {
+        VertexShader = FsQuadCamVecVS();
+        PixelShader = FurShellPrepassPS();
+
+        CullMode = None;
+    }
+}

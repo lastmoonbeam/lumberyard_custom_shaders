@@ -1,0 +1,317 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "ModificatorVT.cfi"
+#include "ModificatorTC.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+    string Script =
+        "Public;"
+        "ShaderDrawType = General;"
+        "ShaderType = FX;"
+>;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+sampler2D diffuseSampler = sampler_state
+{
+    Texture = $Diffuse;
+    AddressU = Wrap;
+    AddressV = Wrap;
+};
+
+sampler2D bumpSampler = sampler_state
+{
+    Texture = $Normal;
+    AddressU = Wrap;
+    AddressV = Wrap;
+};
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+half AnimSpeed
+<
+    register = PER_MATERIAL_2.x;
+    string UIName = "Animation speed";
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 1;
+    float UIStep = 0.01;
+> = 0.05;
+
+half AnimAmplitude
+<
+    register = PER_MATERIAL_2.y;
+    string UIName = "Animation amplitude";
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.01;
+> = 0.3;
+
+half AnimOffset
+<
+    register = PER_MATERIAL_2.z;
+    string UIName = "Animation offset";
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.01;
+> = 0.0;
+
+half BumpTilling // @TODO: Fix spelling when versioning is supported on material settings.
+<
+    register = PER_MATERIAL_2.w;
+    string UIName = "Bump tiling";
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.01;
+> = 0.4;
+
+half BumpAnimSpeed
+<
+    register = PER_MATERIAL_3.x;
+    string UIName = "Bump anim speed";
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 1.0;
+    float UIStep = 0.01;
+> = 0.3;
+
+half BumpScale
+<
+    register = PER_MATERIAL_3.y;
+    string UIName = "Bump scale";
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 0.1;
+    float UIStep = 0.01;
+> = 0.005;
+
+half DiffuseRange
+<
+    register = PER_MATERIAL_3.z;
+    string UIName = "Diffuse Range";
+    string UIWidget = "slider";
+    float UIMin = 1.0;
+    float UIMax = 4.0;
+    float UIStep = 0.01;
+> = 1.0;
+
+half SoftIntersectionFactor
+<
+    register = PER_MATERIAL_3.w;
+    string UIName = "Soft intersection factor";      
+    string UIWidget = "slider";
+    float UIMin = 0.0;
+    float UIMax = 10.0;
+    float UIStep = 0.1;  
+> = 1.0;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct a2v
+{
+    float4 Position : POSITION;
+    float2 baseTC   : TEXCOORD0;
+    float4 color    : COLOR0;
+    float4 Tangent  : TANGENT;
+    float4 Binormal : BINORMAL;
+};
+
+struct v2f
+{
+    float4 Position     : POSITION;
+    float4 baseTC       : TEXCOORDN;
+    float3 bumpTC       : TEXCOORDN;
+
+#if %SOFT_PARTICLE
+    float4 screenProj : TEXCOORDN;
+#endif
+
+#if %_RT_FOG
+    half4 localFogColor : TEXCOORDN;
+#endif
+};
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+v2f ParticleImposterVS(a2v IN)
+{
+    v2f OUT = (v2f)0;
+
+    float4 vPos = IN.Position;
+
+    const bool bCameraRelative = false;
+    float4x4 InstMatrix = GetInstance_WorldMatrix(bCameraRelative);
+    vPos.xyz = mul( InstMatrix, float4(vPos.xyz, 1) );
+
+    OUT.Position = mul(PerView_ViewProjMatr, float4(vPos.xyz, 1)); 
+
+    // Blend 2 frames at diferent phases (similar to flowmaps)
+    float2 vAnimGen = PerView_AnimGenParams.xx * AnimSpeed * float2(1, -BumpAnimSpeed);
+    half scaledAnimAmplitude = AnimAmplitude * saturate(1.0 + AnimOffset - IN.baseTC.y); // scale amplitude via V coordinate
+    float2 vAnimFreq = frac(vAnimGen.x - float2(0.0, 0.5));
+    float4 vAnim = (vAnimFreq * scaledAnimAmplitude - AnimOffset).xxyy * float4(0,1,0,1);
+
+    OUT.baseTC.xyzw = IN.baseTC.xyxy + vAnim.xyzw;
+    OUT.bumpTC.z = saturate( abs(0.5h - vAnimFreq.x) * 2.0h);
+
+#if %NORMAL_MAP
+    //bumpmap's tc    
+    float4 bumpUV = float4((IN.baseTC.xy - 0.5) * BumpTilling + 0.5 + float2(0,vAnimGen.y), 0, 1);
+    _ModifyUV_1(bumpUV, bumpUV, IN.Position);
+    OUT.bumpTC.xy = bumpUV.xy;
+#endif
+        
+    // modify uv for diffuse 1 and 2
+    float4 UV1 = float4(OUT.baseTC.xy, 0, 1);
+    float4 UV2 = float4(OUT.baseTC.zw, 0, 1);
+    _ModifyUV_1(UV1, UV1, IN.Position);
+    _ModifyUV_1(UV2, UV2, IN.Position);
+    OUT.baseTC = float4(UV1.xy, UV2.xy);
+
+#if %SOFT_PARTICLE
+    OUT.screenProj = HPosToScreenTC(OUT.Position);
+#endif
+
+#if %_RT_FOG
+#if !%_RT_VOLUMETRIC_FOG
+    OUT.localFogColor = GetVolumetricFogColor( vPos );
+#else
+    OUT.localFogColor = GetVolumetricFogAnalyticalColorByWorldPos( vPos );
+#endif
+#endif
+
+    return OUT; 
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+pixout ParticleImposterPS(v2f IN)
+{
+    pixout OUT = (pixout) 0;
+
+#if %_RT_DEBUG0 || %_RT_DEBUG1 || %_RT_DEBUG2 || %_RT_DEBUG3
+    DebugOutput(OUT.Color, float4(IN.baseTC.xy, 0, 1));
+    return OUT;
+#endif
+
+    half2 vNormal = 0;
+#if %NORMAL_MAP
+    vNormal = GetNormalMap(bumpSampler, IN.bumpTC.xy) * BumpScale;
+#endif
+    
+    half4 cDiffuseMap  = GetTexture2D(diffuseSampler, IN.baseTC.xy + vNormal.xy);
+    half4 cDiffuseMap2 = GetTexture2D(diffuseSampler, IN.baseTC.zw + vNormal.xy);
+
+    cDiffuseMap = saturate(lerp(cDiffuseMap, cDiffuseMap2, IN.bumpTC.z));
+
+    OUT.Color = half4(PerMaterial_DiffuseColor.xyz * cDiffuseMap.xyz, cDiffuseMap.w * GetInstance_Opacity());
+    OUT.Color.rgb *= (DiffuseRange * DiffuseRange);
+
+#if %_RT_FOG
+#if !%_RT_VOLUMETRIC_FOG
+    OUT.Color.rgb = lerp( IN.localFogColor.xyz, OUT.Color.rgb, IN.localFogColor.w );
+#else
+    VolumetricFogTexcoord vtc = GetVolumetricFogTexcoordParamByScreenPos(IN.Position);
+    float4 vf = GetVolumetricFogValue(vtc);
+    ApplyVolumetricFog(vf, IN.localFogColor, vtc, OUT.Color.rgb);
+#endif
+#endif
+
+#if %SOFT_PARTICLE
+    float sceneDepth = DecodeSceneDepth( sceneDepthSampler, IN.screenProj );
+    half softIntersect = saturate( SoftIntersectionFactor * (sceneDepth - IN.screenProj.w) );
+    OUT.Color.a *= softIntersect;
+#endif
+
+    return OUT;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+technique General
+<
+    string Script =  
+        "TechniqueCustomRender=CustomRenderPass;"
+>
+{
+    pass p0
+    {
+        VertexShader = ParticleImposterVS() ParticleImposterVS;
+        PixelShader = ParticleImposterPS() ParticleImposterPS;
+
+        ZEnable = true;
+        ZWriteEnable = false;
+        CullMode = None;
+
+        AlphaBlendEnable = true;
+        SrcBlend = SrcAlpha;
+        DestBlend = InvSrcAlpha;
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Thermal vision pass
+
+float4 VisionMtlParams : PB_VisionMtlParams;
+
+///////////////// pixel shaders //////////////////
+
+pixout CustomRenderPassPS(v2f IN)
+{
+  pixout OUT = (pixout)0;  
+
+#if !%_RT_SAMPLE0 && %_RT_SAMPLE1
+    half4 cDiffuseMap  = GetTexture2D(diffuseSampler, IN.baseTC.xy); 
+    half4 cDiffuseMap2 = GetTexture2D(diffuseSampler, IN.baseTC.zw);
+    cDiffuseMap = saturate(lerp(cDiffuseMap, cDiffuseMap2, IN.bumpTC.z));
+
+    OUT.Color = half4(PerMaterial_DiffuseColor.xyz * cDiffuseMap.xyz, cDiffuseMap.w * GetInstance_Opacity()  * saturate( VisionMtlParams.x ));
+    OUT.Color.rgb *= (DiffuseRange * DiffuseRange) * OUT.Color.a;  
+    OUT.Color.rgb = dot( OUT.Color.rgb, 1) ;
+
+    #if %SOFT_PARTICLE
+        float sceneDepth = DecodeSceneDepth( sceneDepthSampler, IN.screenProj );
+        half softIntersect = saturate( SoftIntersectionFactor * (sceneDepth - IN.screenProj.w) );
+        OUT.Color.rgb *= softIntersect;
+    #endif
+#endif
+
+  return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique CustomRenderPass
+{
+  pass p0
+  {
+    VertexShader = ParticleImposterVS() CustomRenderVS;
+    PixelShader = CustomRenderPassPS() CustomRenderPS;
+
+    ZEnable = true;
+    ZWriteEnable = false;
+    CullMode = None;
+    ZFunc = LEqual; 
+
+    AlphaBlendEnable = true;
+    SrcBlend = ONE;
+    DestBlend = ONE;
+  }
+}

@@ -1,0 +1,144 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+//
+// Please note this framework might require additional constants remapping if used generally (was only tested on particle rendering so far).
+//
+
+#define MAX_NUM_DLIGHTS_AB           16
+
+float4 g_DLightsInfo[MAX_NUM_DLIGHTS_AB * 3] : PB_DLightsInfo;
+
+struct SLightVolumeInfo
+{
+  float4 vWorldPos;					// xyz: pos, w: radius
+  float4 cColor;						// rgb: color, a: bulb radius
+	float4 vProjectorParams;	// xyz: proj direction, w: cos proj angle
+};
+
+// Fetch light volume information: position and color
+SLightVolumeInfo GetLightVolumeInfo( int idx )
+{
+  SLightVolumeInfo pVolume;
+
+  pVolume.vWorldPos = g_DLightsInfo[ idx * 3 ]; 	
+  pVolume.cColor = g_DLightsInfo[ idx * 3 + 1];
+	pVolume.vProjectorParams = g_DLightsInfo[ idx * 3 + 2];
+
+  return pVolume;
+}
+
+// Return current number of light volumes for shader permutation
+int GetLightVolumesCount()
+{
+  int nLightVolsCount = 0;
+#if %_RT_LIGHTVOLUME0 && !%_RT_LIGHTVOLUME1
+   nLightVolsCount = 4;
+#elif !%_RT_LIGHTVOLUME0 && %_RT_LIGHTVOLUME1
+   nLightVolsCount =  8;
+#elif %_RT_LIGHTVOLUME0 && %_RT_LIGHTVOLUME1
+   nLightVolsCount =  16;
+#endif 
+  return nLightVolsCount;
+}
+
+// Add light properties into accumulators
+void SumLight( inout half4 cAmbient, inout half4 cDirectional, inout half4 vDirectional, half4 vLight, half3 cDiffuse ) 
+{ 
+  // Set a total luminance component in color.a, for averaging
+  half4 cDiffRGBL = half4(cDiffuse, GetLuminance(cDiffuse));
+	
+	// Sum ambient and directional scalar RGBL values
+  // vLight.w = ambient component
+	cAmbient += cDiffRGBL * vLight.w;
+	cDirectional += cDiffRGBL * (1 - vLight.w);
+
+	// Average direction, scaling by overall luminance.
+	vDirectional.xyz += vLight.xyz * (cDiffRGBL.a * (1 - vLight.w));
+}
+
+// Project all light volumes into SH basis
+void ProjectLightVolumeToSH( in float4 vWorldPos, in float4 cGlobalAmbient, in float4 cMatDiffuse, in float3 normal, out half4 cAmbient, out half4 cDirectional, out half4 vDirectional )
+{
+	cAmbient = half4(0,0,0,0);
+  cDirectional = half4(0,0,0,0.00001);
+	vDirectional = half4(0,0,0,0.00001);
+
+  // Backlighting method: half of it goes directly to ambient, half of it reduces the directional scale
+  half fHalfBack = cMatDiffuse.w * 0.5;
+
+#if %_RT_LIGHTVOLUME0 || %_RT_LIGHTVOLUME1
+  const int nLights = GetLightVolumesCount();
+	[unroll]
+  for (int i=0; i<nLights; i++)
+  {
+    SLightVolumeInfo LightVol = GetLightVolumeInfo(i);
+
+    const float epsilon = 0.00001f;
+
+    if (LightVol.vWorldPos.w < epsilon)
+    {
+        break;
+    }
+
+    // If the length of the light vector is 0 (the light source and the SH are at the same position),
+    // use a small offset in the direction of the normal instead to avoid divide by zero during normalization
+    float3 lightVector = LightVol.vWorldPos.xyz - vWorldPos.xyz;
+
+    // isLightVectorValid = 0 when the length squared of the light vector is 0, 1 otherwise.
+    float isLightVectorValid = ceil(saturate(dot(lightVector, lightVector)));
+
+    // Using lerp here allows us to choose between a small offset in the direction of the normal and the light vector while avoiding a branch
+    lightVector = lerp(normal* float3(epsilon, epsilon, epsilon), lightVector, isLightVectorValid);
+    float lightVectorLength = length(lightVector);
+
+    float fFallOff = GetPhysicalLightAttenuation(lightVectorLength, 1.0f / LightVol.vWorldPos.w, LightVol.cColor.w);
+    float4 normalizedLightVectorAndAmbient = float4(lightVector / lightVectorLength, fHalfBack);
+    
+		if( LightVol.vProjectorParams.a > 0 )
+		{			
+			float4 vProj = LightVol.vProjectorParams;
+			half fProjFallof = saturate(( saturate(dot(-normalizedLightVectorAndAmbient.xyz, vProj.xyz)) - vProj.w) / saturate(1.0f - vProj.w));
+			fFallOff *= fProjFallof;
+		}
+
+    half3 cDiffuse = LightVol.cColor.rgb * fFallOff * cGlobalAmbient.w;
+		SumLight(cAmbient, cDirectional, vDirectional, normalizedLightVectorAndAmbient, cDiffuse);
+  }
+#endif // LIGHTVOLUME
+
+  // Add sun. vWorldPos.w = shadow coeff
+  half4 LightVec = half4(PerFrame_SunDirection.xyz, fHalfBack);
+  half3 cDiffuse = PerFrame_SunColor.rgb * vWorldPos.w * cGlobalAmbient.w;
+	SumLight(cAmbient, cDirectional, vDirectional, LightVec, cDiffuse);
+
+  // Add ambient
+	SumLight(cAmbient, cDirectional, vDirectional, half4(0,0,0.5,0.5), cGlobalAmbient.rgb);
+
+  // Add missing directional illumination to ambient
+	half fTotalDir = length(vDirectional);
+	half4 cDirectionalSum = cDirectional * (fTotalDir / cDirectional.w);
+	cAmbient += (cDirectional - cDirectionalSum) * 0.25;
+	cAmbient.rgb *= cMatDiffuse.rgb;
+	cDirectional = cDirectionalSum;
+	cDirectional.rgb *= cMatDiffuse.rgb;
+
+	vDirectional *= (1 - fHalfBack) / fTotalDir;
+  vDirectional.w = fHalfBack;
+}
+
+// Given SHBasis and a direction, return enviroment lighting
+half3 GetEnvLighting( half4 cAmbient, half4 cDirectional, half4 vDirectional, half3 vNormal )
+{
+  return cAmbient.rgb + cDirectional.rgb * max(0, dot(vDirectional.xyz, vNormal) + vDirectional.w);
+}

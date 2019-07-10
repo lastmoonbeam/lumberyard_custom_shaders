@@ -1,0 +1,1523 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+// Original file Copyright Crytek GMBH or its affiliates, used under license.
+
+#define INST_STREAM_CUSTOM   \
+
+#define PI 3.1415
+#define PI_X2 6.2831
+#define PI_X4 12.5663
+
+// Higher values allow for brighter colors, but also increase the separation between individual colors
+#define RGBM_MULTIPLIER 16
+
+// Key that alpha gets cleared to before depth fixup
+#define DEPTH_FIXUP_KEY 100.0f
+
+// Key that is used to inform the motion blur system to fallback
+// to depth-buffer based motion blur for static objects.
+#define MOTION_BLUR_STATIC_OBJECT_KEY 1.0f
+
+//=== Project specific definitions =============================================
+
+//=== Render targets custom ID's ===============================================
+
+#define _RT2D_WATER_ID 0
+#define _RT2D_DEPTH_ID 1
+#define _RT2D_SCREEN_ID 2
+#define _RT2D_REFRACT_ID 3
+#define _RT2D_TRANSLUCENCE_ID 4
+
+// === HDR fake definitions ====================================================
+
+#define HDR_OVERBRIGHT 8
+#define HDR_FAKE_MAXOVERBRIGHT 16
+#define HDR_EXP_OFFSET 128
+#define HDR_EXP_BASE   1.06
+
+// === Lights definitions ======================================================
+
+#define LT_DIRECTIONAL 0
+#define LT_OMNI        1
+#define LT_PROJECTED   2
+#define LT_TILED       4
+
+// === GMEM ====================================================================
+
+#if %ST_GMEM_256BPP || %ST_GMEM_128BPP || %ST_GMEM_PLS
+  #define GMEM 1
+#endif
+
+//=== Common macros ============================================================
+
+#if !GLES3
+	#define EARLYDEPTHSTENCIL [earlydepthstencil]
+#else
+	#define EARLYDEPTHSTENCIL
+#endif
+
+#ifdef %ST_FIXED_POINT
+	#define LIN_DEPTH_PRECISION 16
+	#define LIN_DEPTH_MAX_VAL 65535
+#endif
+
+#if %BLENDLAYER_UV_SET_2 || %EMITTANCE_MAP_UV_SET_2 || %DETAIL_MAPPING_UV_SET_2
+    #define USING_UV_SET_2
+#endif
+//=== Common definitions =======================================================
+
+#include "FXStreamDefs.cfi"
+#include "FXConstantDefs.cfi"
+#include "FXSamplerDefs.cfi"
+
+//==============================================================================
+// The folloing functions handle a non-uniform scale matrix used for vectors transform.
+// Unlike positions, applying a non-uniform scale to vectors will have the reverse effect 
+// (normals for example) and so what we are looking for is a transform combined of the 
+// rotation and with inverted scale.
+// The most commonly known method to do this will take the T matrix and do transpose(inverse(T))
+// The mathc for it is nicely described here: 
+//		http://alfonse.bitbucket.org/oldtut/Illumination/Tut09%20Normal%20Transformation.html
+// A faster way to achieve this is to skip the inverse and to use the fact the matrix T = R * S 
+// when R is rotation and S is non-uniform scale.  Since rotation is always orthonormal we can 
+// derive the scale coefficient and inverse them.  
+// The final result is implementation of fast square inverse and scale of the exsiting 
+// world matrix by only scaling the rows - this in effect takes the cost of the VS down 
+// from 29 more instructions to 13!
+//==============================================================================
+float3 InverseScaledNormal(float3x3 worldMat, float3 normalIn)
+{
+    const float3 xVec = float3(worldMat[0][0], worldMat[1][0], worldMat[2][0]);
+    const float3 yVec = float3(worldMat[0][1], worldMat[1][1], worldMat[2][1]);
+    const float3 zVec = float3(worldMat[0][2], worldMat[1][2], worldMat[2][2]);
+
+    // Notice the following - this is the square - no need to sqrt it because we want 
+    // the inverse the effect which means return to normal + apply inverse, hence square the ratio
+    const float3      scaleVec = 1.0 / float3(dot(xVec, xVec), dot(yVec, yVec), dot(zVec, zVec));
+    const float3x3    invScaleMat = { scaleVec.x,0,0,    0,scaleVec.y,0,    0,0,scaleVec.z };
+
+    // Can be avoided by direct matrix components multiplication (instead of dot = full matrix mut)
+    const float3x3    invScaleWorldMat = mul(worldMat, invScaleMat);
+    const float3      normalOut = normalize(mul(invScaleWorldMat, normalIn));
+
+    return normalOut;
+}
+//------------------------------------------------------------------------------
+// This method will cost approximately 29 instructions - 14% overhead on average
+//------------------------------------------------------------------------------
+float3x3 InverseScaleMatrix(float3x3 worldMat)
+{
+    const float3 xVec = float3(worldMat[0][0], worldMat[1][0], worldMat[2][0]);
+    const float3 yVec = float3(worldMat[0][1], worldMat[1][1], worldMat[2][1]);
+    const float3 zVec = float3(worldMat[0][2], worldMat[1][2], worldMat[2][2]);
+
+    // Notice the following - this is the square - no need to sqrt it because we want
+    // the inverse the effect which means return to normal + apply inverse, hence square the ratio
+    const float3      scaleVec = 1.0 / float3(dot(xVec, xVec), dot(yVec, yVec), dot(zVec, zVec));
+    const float3x3    invScaleMat = { scaleVec.x,0,0,    0,scaleVec.y,0,    0,0,scaleVec.z };
+
+    // Can be avoided by direct matrix components multiplication (instead of dot = full matrix mut)
+    const float3x3    invScaleWorldMat = mul(worldMat, invScaleMat);
+
+    return invScaleWorldMat;
+}
+//------------------------------------------------------------------------------
+// This optimized version cost approximately 13 instructions!!! ~6% overhead on average
+//------------------------------------------------------------------------------
+float3x3 InverseScaleMatrixFast(float3x3 worldMat)
+{
+    const float3x3    trWrlMat = transpose(worldMat);
+    const float3      scaleVec = 1.0 / float3(dot(trWrlMat[0], trWrlMat[0]), dot(trWrlMat[1], trWrlMat[1]), dot(trWrlMat[2], trWrlMat[2]));
+    float3x3          invScaleWorldMat;
+
+    invScaleWorldMat[0] = trWrlMat[0] * scaleVec.x;
+    invScaleWorldMat[1] = trWrlMat[1] * scaleVec.y;
+    invScaleWorldMat[2] = trWrlMat[2] * scaleVec.z;
+
+    invScaleWorldMat = transpose(invScaleWorldMat);
+
+    return invScaleWorldMat;
+}
+
+//------------------------------------------------------------------------------
+// Get fog/alpha value for fog volume only.
+//------------------------------------------------------------------------------
+float GetFogVolumeValue(float3 position)
+{
+    float distLength = distance(PerView_WorldViewPos.xyz, position);
+    float fogInt = distLength * exp(-dot(position - FogVol_HeightFallOffBasePoint, FogVol_HeightFallOffDirScaled));
+    float fog = 1 - exp2(-FogVol_GlobalDensity * max(fogInt - FogVol_DensityOffset, 0));
+    return fog;
+}
+
+//------------------------------------------------------------------------------
+// Get fog/alpha value for fog volume only.
+//------------------------------------------------------------------------------
+float GetFogVolumeValue(float3 position, float distLength)
+{
+    float fogInt = distLength * exp(-dot(position - FogVol_HeightFallOffBasePoint, FogVol_HeightFallOffDirScaled));
+    float fog = 1 - exp2(-FogVol_GlobalDensity * max(fogInt - FogVol_DensityOffset, 0));
+    return fog;
+}
+//==============================================================================
+bool IntersectionBoxRay(float3 bmin, float3 bmax, float3 origin, float3 dir)
+{
+    float tmax = 100000;
+    float tmin = -tmax;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (dir[i] != 0.0)
+        {
+            float t1 = (bmin[i] - origin[i]) / dir[i];
+            float t2 = (bmax[i] - origin[i]) / dir[i];
+
+            tmin = max(tmin, min(t1, t2));
+            tmax = min(tmax, max(t1, t2));
+        }
+        else if (origin[i] <= bmin[i] || origin[i] >= bmax[i])
+        {
+            return false;
+        }
+    }
+    return tmax > tmin && tmax > 0.0;
+}
+
+bool IntersectionBoxRay(float3 bmin, float3 bmax, float3 origin, float3 dir,out float tminOut, out float tmaxOut)
+{
+    float tmax = 100000;
+    float tmin = -tmax;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (dir[i] != 0.0)
+        {
+            float t1 = (bmin[i] - origin[i]) / dir[i];
+            float t2 = (bmax[i] - origin[i]) / dir[i];
+
+            tmin = max(tmin, min(t1, t2));
+            tmax = min(tmax, max(t1, t2));
+        }
+        else if (origin[i] <= bmin[i] || origin[i] >= bmax[i])
+        {
+            return false;
+        }
+    }
+    tmaxOut = tmax;
+    tminOut = tmin;
+    return tmax > tmin && tmax > 0.0;
+}
+
+float GetFogVolumeGlobalValue(float3 position)
+{
+    float3 camPos = PerView_WorldViewPos;
+    float3 rayCameraToVertex = normalize(PerView_WorldViewPos - position);
+    float3 bmin = AvgFogVolumeContrib[1].xyz;
+    float3 bmax = AvgFogVolumeContrib[2].xyz;
+    float fog = 0, tmin, tmax;
+    float intersects = IntersectionBoxRay(bmin, bmax, position, rayCameraToVertex, tmin, tmax) ? 1.0 : 0.0;
+
+    float isInside = (position.x > bmin.x&&position.x < bmax.x) && (position.y > bmin.y&&position.y < bmax.y) && (position.z > bmin.z&&position.z < bmax.z) ? 1.0 : 0.0;
+    float isCamInside = FogVol_CameraInside;
+
+    float3 positionEnteringVolume = position + rayCameraToVertex * tmin;
+    float3 positionLeavinggVolume = position + rayCameraToVertex * tmax;
+
+    // Compute distances here so we do not have to compute them in the GetFogVolume function.
+    float distLength = sqrt(dot(PerView_WorldViewPos, position));
+    float distLengthtMax = distLength + rayCameraToVertex * tmax;
+    float distLengthtMin = distLength + rayCameraToVertex * tmin;
+
+    fog += GetFogVolumeValue(positionEnteringVolume, distLengthtMin) * intersects*(1 - isCamInside) * (1 - isInside);
+    fog += GetFogVolumeValue(positionLeavinggVolume, distLengthtMax) * intersects*(1 - isCamInside);
+    fog += GetFogVolumeValue(position, distLength) * intersects;
+    
+    // if we are near the fog volume, then consider we are inside.
+    if (distLengthtMax < (1.0f))
+    {
+        isCamInside = 1.0;
+    }
+    fog += GetFogVolumeValue(camPos + rayCameraToVertex,1.0f)*(isCamInside);
+ 
+    return fog * FogVol_AABBox_Valid;
+}
+//==============================================================================
+
+void ComputeGlobalFogPS(inout half3 cOut, float fDist)
+{
+#if %_RT_FOG
+  cOut.xyz = lerp(PerView_FogColor.xyz, cOut.xyz, fDist);
+#endif
+}
+
+// Common functions
+half4 EXPAND( half4 a )
+{
+  return a * 2 - 1;
+}
+half3 EXPAND( half3 a )
+{
+  return a * 2 - 1;
+}
+half EXPAND( half a )
+{
+  return a * 2 - 1;
+}
+half2 EXPAND( half2 a )
+{
+  return a * 2 - 1;
+}
+
+float3 TangNormalUnnormalized(float4 Tangent, float4 Binormal)
+{
+  return cross(Tangent.xyz, Binormal.xyz) * Tangent.w;
+}
+
+float3 TangNormal(float4 Tangent, float4 Binormal)
+{
+  return normalize(TangNormalUnnormalized(Tangent, Binormal));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half2 GetXYNormalMap(sampler2D bumpMap, float2 uv)
+{
+#if IOSMETAL || GLES3
+  // IOS and Android normal maps are unsigned normalized.
+  return EXPAND(tex2D(bumpMap, uv).xy);
+#else
+    return tex2D(bumpMap, uv).yx;
+#endif
+}
+
+half2 GetXYNormalMapLod(sampler2D bumpMap, float4 bumpTC)
+{
+#if IOSMETAL || GLES3
+  // IOS and Android normal maps are unsigned normalized.
+  return EXPAND(tex2Dlod(bumpMap, bumpTC).xy);
+#else
+  return tex2Dlod(bumpMap, bumpTC).yx;
+#endif
+}
+
+half2 GetXYNormalMapGrad(sampler2D bumpMap, float2 bumpTC, float2 ddx_bumpTC, float2 ddy_bumpTC)
+{
+#if IOSMETAL || GLES3
+  // IOS and Android normal mapsare unsigned normalized.
+  return EXPAND(tex2Dgrad(bumpMap, bumpTC, ddx_bumpTC, ddy_bumpTC).xy);
+#else
+  return tex2Dgrad(bumpMap, bumpTC, ddx_bumpTC, ddy_bumpTC).yx;
+#endif
+}
+
+half3 GetNormalMap(sampler2D bumpMap, float2 bumpTC)
+{
+  half3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMap(bumpMap, bumpTC.xy);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+half3 GetNormalMapLod(sampler2D bumpMap, float4 bumpTC)
+{
+  half3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapLod(bumpMap, bumpTC);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+half3 GetNormalMapGrad(sampler2D bumpMap, float2 bumpTC, float2 ddx_bumpTC, float2 ddy_bumpTC)
+{
+  half3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapGrad(bumpMap, bumpTC, ddx_bumpTC, ddy_bumpTC);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+half3 GetNormalMap(sampler2D bumpMap, float2 bumpTC, float scale)
+{
+  half3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMap(bumpMap, bumpTC.xy);
+  bumpNormal.z = scale;
+
+  return normalize(bumpNormal);
+}
+
+half3 GetNormalMapLod(sampler2D bumpMap, float4 bumpTC, float scale)
+{
+  half3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapLod(bumpMap, bumpTC);
+  bumpNormal.z = scale;
+
+  return normalize(bumpNormal);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half4 GetTexture2DGrad(sampler2D texSampler, float2 uv, float2 ddxUV, float2 ddyUV)
+{
+  return tex2Dgrad(texSampler, uv, ddxUV, ddyUV);
+}
+
+half4 GetTexture2DLod(sampler2D texSampler, float4 uv)
+{
+  return tex2Dlod(texSampler, uv);
+}
+
+half4 GetTexture2DProj(sampler2D texSampler, float4 uv)
+{
+  return tex2Dproj(texSampler, uv);
+}
+
+half4 GetTexture2DBias(sampler2D texSampler, float4 uv)
+{
+  return tex2Dbias(texSampler, uv);
+}
+
+half4 GetTexture2D(sampler2D MapSampler, float2 uv)
+{
+    return tex2D(MapSampler, uv);
+}
+
+// Sample the texture with pixel offset which is a multiple of 0.5 (upto 8)
+// fTexelSize should be float in order to avoid precision artifacts
+half4 GetTexture2D_Offset(sampler2D smpl, half2 txCrd, half2 offset, float2 texelSize)
+{
+  half4 res;
+
+  res = tex2D(smpl, txCrd + offset*texelSize);
+
+  return res;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half4 GetDetailMap(sampler2D texSampler, float2 uv)
+{
+  return GetTexture2D(texSampler, uv.xy).garb * half4(2.0h, 2.0h, 2.0h, 2.0h) - half4(1.0h, 1.0h, 1.0h, 1.0h);
+}
+
+half4 GetDetailMapLod(sampler2D texSampler, float4 uv)
+{
+  return GetTexture2DLod(texSampler, uv.xyzw).garb * half4(2.0h, 2.0h, 2.0h, 2.0h) - half4(1.0h, 1.0h, 1.0h, 1.0h);
+}
+
+half4 GetDiffuseMap(sampler2D textureSampler, float2 uv)
+{
+    return tex2D(textureSampler, uv);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Gradient maps
+
+float GetGradientMap(sampler2D gradientSampler, float2 vTC, float fGradientAnimation, float fGradientTransitionRange)
+{
+	float fGradient = 1.f - tex2Dlod(gradientSampler, float4(vTC,0,0)).x;
+	float fRange = max(fGradientTransitionRange, 0.0001f);
+
+	float fAnimation = fGradientAnimation * (1.f + 2.f * fRange) - fRange;
+	return saturate((fAnimation - fGradient) / fRange);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Depth
+
+#define USE_DEVICE_DEPTH
+
+float GetDepthMap(sampler2D depthSampler, float2 ScreenTC)
+{
+	return tex2D(depthSampler, ScreenTC.xy).x;
+}
+
+float GetDepthMap(Texture2D depthTexture, float2 ScreenTC)
+{
+	int3 vPixCoord = int3(ScreenTC * PS_ScreenSize.xy, 0);
+	return depthTexture.Load(vPixCoord).x;
+}
+
+float GetLinearDepth(float fDevDepth, bool bDrawNearAdjust=true, bool bScaled=false)
+{
+	if( bScaled )
+	{
+		return fDevDepth * PerView_NearFarClipDist.y;
+	}
+
+  	return fDevDepth;
+}
+float GetDeviceDepth(float fLinearDepth)
+{
+	return fLinearDepth;
+}
+
+float GetDeviceDepthH(sampler2D depthSampler, float2 ScreenTC)
+{
+	float Z	= tex2D(depthSampler, ScreenTC).x;
+	//on PC we just have linear depth and need to project it again
+	Z	=	PerView_ProjRatio.y/Z+PerView_ProjRatio.x;
+	return Z;
+}
+
+float LinearizeDeviceDepth(float deviceDepth)
+{
+	const float fNearestMax = PerView_ProjRatio.y / (PerView_NearestScaled.z - PerView_ProjRatio.x);
+	float fDepthLinear = PerView_ProjRatio.y / (deviceDepth - PerView_ProjRatio.x);
+
+	if (fDepthLinear < fNearestMax)
+	{
+		fDepthLinear = PerView_NearestScaled.y / (deviceDepth - PerView_NearestScaled.x);
+	}
+
+  	return fDepthLinear;
+}
+
+//	Igor: storing depth as FP16 greatly decreases quantisation error closer to the camera
+//	which greatly improves position reconstruction
+//	However, storing depth as integer simplifies debugging since the data in RT will be human-readable.
+//	Please, uncomment this macro once GMEM path will support storing depth as FP16.
+//#define	STORE_FP16_DEPTH_AS_INT16
+
+#ifdef %ST_FIXED_POINT
+
+float DecodeLinearDepth(uint depthIn)
+{
+#ifndef	STORE_FP16_DEPTH_AS_INT16
+	return depthIn / (LIN_DEPTH_MAX_VAL * 1.f);
+#else
+	return f16tof32(depthIn);
+#endif
+}
+
+uint EncodeLinearDepth(float depthIn)
+{
+#ifndef	STORE_FP16_DEPTH_AS_INT16
+	return depthIn * LIN_DEPTH_MAX_VAL;
+#else
+	return f32tof16(depthIn);
+#endif
+}
+
+float GetLinearDepth(Texture2D <uint> depthSampler, int2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	float fDepth = DecodeLinearDepth(depthSampler.Load( int3(ScreenTC, 0) ).x);
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepth(Texture2D <uint> depthSampler, float2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	float Width;
+	float Height;
+	depthSampler.GetDimensions(Width, Height);
+	int3 vPixCoord = int3( ScreenTC * float2(Width, Height), 0);
+	float fDepth = DecodeLinearDepth(depthSampler.Load( vPixCoord ).x);
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepth_ProjTC(Texture2D <uint> depthSampler, float4 ProjTC, bool bDrawNearAdjust=true)
+{
+	float Width;
+	float Height;
+	depthSampler.GetDimensions(Width, Height);
+	int3 vPixCoord = int3( (ProjTC.xy / ProjTC.w) * float2(Width, Height), 0);
+	float fDepth = DecodeLinearDepth(depthSampler.Load( vPixCoord ).x);
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepthPrecise(Texture2D <uint> depthSampler, float2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	return GetLinearDepth(depthSampler, ScreenTC, bDrawNearAdjust);
+}
+
+float GetLinearDepthScaled( Texture2D <uint> depthSampler, float2 ScreenTC )
+{
+	return GetLinearDepth( depthSampler, ScreenTC ) * PerView_NearFarClipDist.y;
+}
+
+#else
+
+float GetLinearDepth(sampler2D depthSampler, float2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	float fDepth = tex2D( depthSampler, ScreenTC.xy ).x;
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepth(Texture2D depthTexture, float2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	int3 vPixCoord = int3(ScreenTC * PS_ScreenSize.xy, 0);
+	float fDepth = depthTexture.Load(vPixCoord).x;
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepth(Texture2D depthTexture, int2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	int3 vPixCoord = int3( ScreenTC, 0);
+	float fDepth = depthTexture.Load(vPixCoord).x;
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepth_ProjTC(sampler2D depthSampler, float4 ProjTC, bool bDrawNearAdjust=true)
+{
+	float fDepth = tex2Dproj( depthSampler, ProjTC ).x;
+	return GetLinearDepth(fDepth, bDrawNearAdjust);
+}
+
+float GetLinearDepthPrecise(sampler2D depthSampler, float2 ScreenTC, bool bDrawNearAdjust=true)
+{
+	return GetLinearDepth(depthSampler, ScreenTC, bDrawNearAdjust);
+}
+
+float GetLinearDepthScaled( sampler2D smpDepth, float2 ScreenTC )
+{
+ 	return GetLinearDepth( smpDepth, ScreenTC ) * PerView_NearFarClipDist.y;
+}
+
+float GetLinearDepthScaled( Texture2D texDepth, float2 ScreenTC )
+{
+ 	return GetLinearDepth( texDepth, ScreenTC ) * PerView_NearFarClipDist.y;
+}
+#endif // defined(%ST_FIXED_POINT)
+
+float2 GetScreenCoordsFromProj(float4 screenProj)
+{
+    return (screenProj.xy / screenProj.ww) * PS_ScreenSize.xy;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Gather emulation.
+#ifdef	%ST_GLES3_0
+float4  GatherRed( Texture2D<float4> t, in sampler s, in float2 location, in float2 texDimensions, in int2 offset = int2(0,0))
+{
+	int3 vPixCoord = int3( location * texDimensions, 0);
+	vPixCoord.xy += offset;
+
+	float4 res[4];
+	res[0] = t.Load( vPixCoord, uint2(0,1) );
+	res[1] = t.Load( vPixCoord, uint2(1,1) );
+	res[2] = t.Load( vPixCoord, uint2(1,0) );
+	res[3] = t.Load( vPixCoord, uint2(0,0) );
+
+	float4 red;
+
+	[unroll]
+	for (int i=0; i<4; ++i)
+	{
+		red[i] = res[i].x;
+	}
+
+	return red;
+}
+
+uint4	GatherRed( Texture2D<uint4> t, in sampler s, in float2 location, in float2 texDimensions, in int2 offset = int2(0,0))
+{
+	int3 vPixCoord = int3( location * texDimensions, 0);
+	vPixCoord.xy += offset;
+
+	uint4 res[4];
+	res[0] = t.Load( vPixCoord, uint2(0,1) );
+	res[1] = t.Load( vPixCoord, uint2(1,1) );
+	res[2] = t.Load( vPixCoord, uint2(1,0) );
+	res[3] = t.Load( vPixCoord, uint2(0,0) );
+
+	uint4 red;
+
+	[unroll]
+	for (int i=0; i<4; ++i)
+	{
+		red[i] = res[i].x;
+	}
+
+	return red;
+}
+void GatherRedGreen( Texture2D<uint4> t, in sampler s, in float2 location, out uint4 red, out uint4 green, in float2 texDimensions, in int2 offset = int2(0,0))
+{
+	int3 vPixCoord = int3( location * texDimensions, 0);
+	vPixCoord.xy += offset;
+
+	uint4 res[4];
+	res[0] = t.Load( vPixCoord, uint2(0,1) );
+	res[1] = t.Load( vPixCoord, uint2(1,1) );
+	res[2] = t.Load( vPixCoord, uint2(1,0) );
+	res[3] = t.Load( vPixCoord, uint2(0,0) );
+
+	[unroll]
+	for (int i=0; i<4; ++i)
+	{
+		red[i] = res[i].x;
+		green[i] = res[i].y;
+	}
+}
+
+void GatherRedGreen( Texture2D<float4> t, in sampler s, in float2 location, out float4 red, out float4 green, in float2 texDimensions, in int2 offset = int2(0,0))
+{
+	int3 vPixCoord = int3( location * texDimensions, 0);
+	vPixCoord.xy += offset;
+
+	float4 res[4];
+	res[0] = t.Load( vPixCoord, uint2(0,1) );
+	res[1] = t.Load( vPixCoord, uint2(1,1) );
+	res[2] = t.Load( vPixCoord, uint2(1,0) );
+	res[3] = t.Load( vPixCoord, uint2(0,0) );
+
+	[unroll]
+	for (int i=0; i<4; ++i)
+	{
+		red[i] = res[i].x;
+		green[i] = res[i].y;
+	}
+}
+#else
+float4	GatherRed( Texture2D<float4> t, in SamplerState s, in float2 location, in float2 texDimensions = float2(0,0), in int2 offset = int2(0,0))
+{
+	return t.GatherRed(s, location, offset);
+}
+uint4	GatherRed( Texture2D<uint4> t, in SamplerState s, in float2 location, in float2 texDimensions = float2(0,0), in int2 offset = int2(0,0))
+{
+	return t.GatherRed(s, location, offset);
+}
+void GatherRedGreen( Texture2D<float4> t, in SamplerState s, in float2 location, out float4 red, out float4 green, in float2 texDimensions = float2(0,0), in int2 offset = int2(0,0))
+{
+	red = t.GatherRed(s, location, offset);
+	green = t.GatherGreen(s, location, offset);
+}
+void GatherRedGreen( Texture2D<uint4> t, in SamplerState s, in float2 location, out uint4 red, out uint4 green, in float2 texDimensions = float2(0,0), in int2 offset = int2(0,0))
+{
+	red = t.GatherRed(s, location, offset);
+	green = t.GatherGreen(s, location, offset);
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Motion vector
+
+float2 EncodeMotionVector(float2 vMotion, bool bFastEncode = false, bool bInvert = false)
+{
+    if( bInvert )
+        vMotion.y *= -1.f;
+
+    if( !bFastEncode )
+        vMotion = sqrt(abs(vMotion))* (vMotion.xy>0.0f ? float2(1, 1) : float2(-1, -1));
+
+    vMotion = vMotion* 0.5h + 127.f/255.f;
+    return vMotion.xy;
+}
+
+float2 DecodeMotionVector(float2 vMotionEncoded, bool bFastEncoded = false)
+{
+    if( bFastEncoded )
+    {
+        return (vMotionEncoded - 127.0f/255.0f) * 2.0f;
+    }
+
+    vMotionEncoded.xy = (vMotionEncoded.xy - 127.f/255.f) * 2.0f;
+    return (vMotionEncoded.xy * vMotionEncoded.xy) * (vMotionEncoded.xy>0.0f ? float2(1, 1) : float2(-1, -1));
+}
+
+float2 OutputVelocityRT(float2 vCurrPos, float2 vPrevPos)
+{
+    return (vPrevPos - vCurrPos);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Encode a float value into 3 bytes (input value should be in the range of [0, 1])
+float3 PackFloatToVec3(const float value)
+{
+	static const float3 bitSh = float3(256.0 * 256.0, 256.0, 1.0);
+	static const float3 bitMsk = float3(0.0, 1.0/256.0, 1.0/256.0);
+	float3 res = frac(value * bitSh);
+	res -= res.xxy * bitMsk;
+	return res;
+}
+
+float UnpackFloatFromVec3(const float3 value)
+{
+	static const float3 bitSh = float3(1.0/(256.0*256.0), 1.0/256.0, 1.0);
+	return dot(value, bitSh);
+}
+
+half GetDownscaledDepth(in float4 rawDepth)
+{
+	return rawDepth.x;
+}
+
+half GetUnnormalizedLinearDownscaledDepth(in float4 rawDepth)
+{
+	return rawDepth.x;
+}
+
+half GetUnnormalizedLinearDownscaledDepth(in sampler2D depthSmp, in float2 screenCoord)
+{
+	float4 data = tex2D(depthSmp, screenCoord);
+	return GetUnnormalizedLinearDownscaledDepth(data);
+}
+
+#ifdef %ST_FIXED_POINT
+float GetDownscaledDepth(in Texture2D <uint> depthSmp, in float2 screenCoord)
+{
+	uint Width;
+	uint Height;
+	depthSmp.GetDimensions(Width, Height);
+	float4 data = DecodeLinearDepth(depthSmp.Load( int3(screenCoord.x*Width, screenCoord.y*Height, 0) ));
+	return GetDownscaledDepth(data);
+}
+#else
+half GetDownscaledDepth(in sampler2D depthSmp, in float2 screenCoord)
+{
+	float4 data = tex2D(depthSmp, screenCoord);
+	return GetDownscaledDepth(data);
+}
+#endif
+
+// get 2d homogeneous position
+float4 Get2dHPos(float4 pos)
+{
+	float4 hPos;
+	hPos.zw = pos.zw;
+	hPos.xy = (pos.xy * float2(2.0,-2.0)) - float2(1.0,-1.0);
+	return hPos;
+}
+
+float2 GetScaledScreenTC(float2 TC)
+{
+#ifdef %_PS
+	return TC*PerView_HPosScale.xy;
+#else
+	return TC*PerView_HPosScale.xy;
+#endif
+}
+
+float4 HPosToScreenTC(float4 HPos, bool scaled = true)
+{
+  float4 ScrTC = HPos;
+  ScrTC.xy = (HPos.xy * float2(1,-1) + HPos.ww) * 0.5;
+
+  if(scaled)
+  {
+    ScrTC.xy = GetScaledScreenTC(ScrTC.xy);
+  }
+
+  return ScrTC;
+}
+
+float2 ClampScreenTC(float2 TC, float2 maxTC)
+{
+	return clamp(TC, 0, maxTC.xy);
+}
+
+float2 ClampScreenTC(float2 TC)
+{
+	return clamp(TC, 0, PerView_HPosScale.xy);
+}
+
+sampler2D normalsSampler2D = sampler_state
+{
+  Texture = EngineAssets/ScreenSpace/NormalsFitting.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+void CompressUnsignedNormalToNormalsBuffer(inout half4 vNormal)
+{
+	#if !%DETAIL_MAPPING && !%TEMP_VEGETATION && !%_RT_ALPHABLEND && !%_RT_ALPHATEST
+		// expand from unsigned
+		vNormal.rgb = vNormal.rgb * 2.h - 1.h;
+
+		// renormalize (needed if any blending or interpolation happened before)
+		vNormal.rgb = normalize(vNormal.rgb);
+		// get unsigned normal for cubemap lookup (note the full float presision is required)
+		half3 vNormalUns = abs(vNormal.rgb);
+		// get the main axis for cubemap lookup
+		half maxNAbs = max(vNormalUns.z, max(vNormalUns.x, vNormalUns.y));
+		// get texture coordinates in a collapsed cubemap
+		float2 vTexCoord = vNormalUns.z<maxNAbs?(vNormalUns.y<maxNAbs?vNormalUns.yz:vNormalUns.xz):vNormalUns.xy;
+		vTexCoord = vTexCoord.x < vTexCoord.y ? vTexCoord.yx : vTexCoord.xy;
+		vTexCoord.y /= vTexCoord.x;
+		// fit normal into the edge of unit cube
+		vNormal.rgb /= maxNAbs;
+
+		// look-up fitting length and scale the normal to get the best fit
+		#if %_RT_QUALITY || %_RT_QUALITY1
+			float fFittingScale = tex2Dlod(normalsSampler2D, float4(vTexCoord, 0, 0)).a;
+		#else
+			float fFittingScale = tex2D(normalsSampler2D, vTexCoord).a;
+		#endif
+
+		// scale the normal to get the best fit
+		vNormal.rgb *= fFittingScale;
+
+		// squeeze back to unsigned
+		vNormal.rgb = vNormal.rgb * .5h + .5h;
+	#endif
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Deferred Shading Common
+
+#define LIGHTINGMODEL_STANDARD       0
+#define LIGHTINGMODEL_TRANSMITTANCE  1
+#define LIGHTINGMODEL_POM_SS         2
+
+#define MAX_FRACTIONAL_8_BIT        (255.0f / 256.0f)
+#define MIDPOINT_8_BIT              (127.0f / 255.0f)
+#define TWO_BITS_EXTRACTION_FACTOR  (3.0f + MAX_FRACTIONAL_8_BIT)
+
+struct MaterialAttribsCommon
+{
+	half3  NormalWorld;
+	half3  Albedo;
+	half3  Reflectance;
+	half3  Transmittance;
+	half   Smoothness;
+	half   ScatteringIndex;
+	half   SelfShadowingSun;
+	int    LightingModel;
+	half   Occlusion;
+};
+
+MaterialAttribsCommon MaterialAttribsDefault()
+{
+    MaterialAttribsCommon attribs = (MaterialAttribsCommon) 0;
+//  Confetti BEGIN: Igor Lobanchikov
+    //    Igor: we need this because some default shaders just write default values to RT.
+    //    This leads to 0-length vector normalization which in turn generates NaNs and/or breaks
+    //    HLSLcc
+    attribs.NormalWorld = 1.0f;
+//  Confetti End: Igor Lobanchikov
+    return attribs;
+}
+
+half3 EncodeColorYCC( half3 col )
+{
+	half3 encodedCol;
+
+	// Y'Cb'Cr'
+	col = sqrt( col );
+	encodedCol.x = dot( half3(0.299, 0.587, 0.114), col.rgb );
+	encodedCol.y = dot( half3(-0.1687, -0.3312, 0.5), col.rgb );
+	encodedCol.z = dot( half3(0.5, -0.4186, -0.0813), col.rgb );
+
+	return half3(encodedCol.x, encodedCol.y * MIDPOINT_8_BIT + MIDPOINT_8_BIT, encodedCol.z * MIDPOINT_8_BIT + MIDPOINT_8_BIT);
+}
+
+half3 DecodeColorYCC( half3 encodedCol, const bool useChrominance = true )
+{
+	encodedCol = half3(encodedCol.x, encodedCol.y / MIDPOINT_8_BIT - 1, encodedCol.z / MIDPOINT_8_BIT - 1);
+	if (!useChrominance) encodedCol.yz = 0;
+
+	// Y'Cb'Cr'
+	half3 col;
+	col.r = encodedCol.x + 1.402 * encodedCol.z;
+	col.g = dot( half3( 1, -0.3441, -0.7141 ), encodedCol.xyz );
+	col.b = encodedCol.x + 1.772 * encodedCol.y;
+
+	return col * col;
+}
+
+half DecodeSunSelfShadowing( half4 bufferA, half4 bufferB, half4 bufferC )
+{
+	half lightingModel = floor(bufferA.w * TWO_BITS_EXTRACTION_FACTOR);
+	return lightingModel == LIGHTINGMODEL_POM_SS ? saturate(bufferC.z / MIDPOINT_8_BIT - 1) : 0;
+}
+
+// For the rare case when MaterialAttribsCommon is entirely zero.
+// Calling EncodeGBuffer in that case causes a division by zero in CompressUnsignedNormalToNormalsBuffer.
+void EncodeEmptyGBuffer( MaterialAttribsCommon attribs, out half4 bufferA, out half4 bufferB, out half4 bufferC )
+{
+	bufferA = float4(0.5f, 0.5f, 0.5f, 0.0f);
+	bufferB = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	bufferC.x = 0.0f;
+	bufferC.yzw = EncodeColorYCC( float3(0.0f, 0.0f, 0.0f) );
+}
+
+void EncodeGBuffer( MaterialAttribsCommon attribs, out half4 bufferA, out half4 bufferB, out half4 bufferC, in const bool doCompressNormal=true )
+{
+	bufferA.xyz = attribs.NormalWorld * 0.5 + 0.5;
+	bufferA.w = 0;
+
+	[flatten]
+	if (doCompressNormal)
+	{
+		CompressUnsignedNormalToNormalsBuffer( bufferA );
+	}
+
+	bufferB.xyz = sqrt( attribs.Albedo );
+	bufferB.w = 0;
+
+	bufferC.x = attribs.Smoothness;
+	bufferC.yzw = EncodeColorYCC( attribs.Reflectance );
+
+	if (attribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
+	{
+		// Encoding for SSS: integer part is profile, frac is amount
+		half scatteringAmount = frac( attribs.ScatteringIndex );
+		// Need to extract the ScatteringIndex outside the ternary operator because it causes compilation issues on mobile.
+		half scattIndex = attribs.ScatteringIndex / TWO_BITS_EXTRACTION_FACTOR;
+		bufferB.w = scatteringAmount > 0.01 ? scattIndex : 0;
+
+		attribs.Transmittance = EncodeColorYCC( attribs.Transmittance );
+		bufferA.w = attribs.Transmittance.x;
+		bufferC.zw = attribs.Transmittance.yz;
+	}
+	else if (attribs.LightingModel == LIGHTINGMODEL_POM_SS)
+	{
+		// Remap range so that chrominance of gray (0.5) and zero POM SS map to the same value
+		bufferC.z = attribs.SelfShadowingSun * MIDPOINT_8_BIT + MIDPOINT_8_BIT;
+	}
+	else if (attribs.LightingModel == LIGHTINGMODEL_STANDARD)
+	{
+		bufferB.w = attribs.Occlusion;
+	}
+
+	bufferA.w = ((float)attribs.LightingModel + (bufferA.w * MAX_FRACTIONAL_8_BIT)) / TWO_BITS_EXTRACTION_FACTOR;
+}
+
+void SetGBufferBlending( inout half4 bufferA, inout half4 bufferB, inout half4 bufferC,
+                         half alphaNormals, half alphaDiffuse, half alphaSpecular )
+{
+	bufferA.w = alphaNormals;
+	bufferB.w = alphaDiffuse;
+	bufferC.w = alphaSpecular;
+}
+
+MaterialAttribsCommon DecodeGBuffer( half4 bufferA, half4 bufferB, half4 bufferC )
+{
+	MaterialAttribsCommon attribs;
+
+	attribs.LightingModel = (int)floor(bufferA.w * TWO_BITS_EXTRACTION_FACTOR);
+
+	attribs.NormalWorld = normalize( bufferA.xyz * 2 - 1 );
+	attribs.Albedo = bufferB.xyz * bufferB.xyz;
+	attribs.Reflectance = DecodeColorYCC( bufferC.yzw, attribs.LightingModel == LIGHTINGMODEL_STANDARD );
+	attribs.Smoothness = bufferC.x;
+	attribs.ScatteringIndex = bufferB.w * TWO_BITS_EXTRACTION_FACTOR;
+	if (attribs.LightingModel == LIGHTINGMODEL_STANDARD)
+	{
+		attribs.Occlusion = bufferB.w;
+	}
+	else
+	{
+		attribs.Occlusion = 1.0;
+	}
+
+	attribs.Transmittance = half3( 0, 0, 0 );
+	if (attribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
+	{
+		attribs.Transmittance = DecodeColorYCC( half3( frac(bufferA.w * TWO_BITS_EXTRACTION_FACTOR), bufferC.z, bufferC.w ) );
+	}
+
+	attribs.SelfShadowingSun = 0;
+	if (attribs.LightingModel == LIGHTINGMODEL_POM_SS)
+	{
+		attribs.SelfShadowingSun = saturate(bufferC.z / MIDPOINT_8_BIT - 1);
+	}
+
+	return attribs;
+}
+
+half3 DecodeGBufferNormal( half4 bufferA )
+{
+	return normalize( bufferA.xyz * 2 - 1 );
+}
+
+half4 DecodeGBufferAlbedoAndScattering( half4 bufferB )
+{
+	return half4( bufferB.xyz * bufferB.xyz, bufferB.w * TWO_BITS_EXTRACTION_FACTOR );
+}
+
+half DecodeGBufferTransmittanceLum( half4 bufferA )
+{
+	half lightingModel = floor( bufferA.w * TWO_BITS_EXTRACTION_FACTOR );
+	return (lightingModel == LIGHTINGMODEL_TRANSMITTANCE) ? frac( bufferA.w * TWO_BITS_EXTRACTION_FACTOR ) : 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float  NumInstructions		: PI_NumInstructions;
+
+sampler2D DebugMipColorsDiffuseSampler = sampler_state
+{
+ Texture = $MipColors_Diffuse;
+};
+sampler2D DebugMipColorsBumpSampler = sampler_state
+{
+ Texture = $MipColors_Bump;
+};
+
+float4 DVColor(float2 d)
+{
+  float Reso = 512;
+  float TargetDeriv = 1.0f/Reso;
+  float HalfTD = (TargetDeriv*0.5);
+  float TwoTD = (TargetDeriv*2.0);
+
+
+  float4 dd = float4(0,0,0,1);
+  if (d.x > TwoTD) { dd.x = 1.0;}
+  if (d.y > TwoTD) { dd.y = 1.0;}
+  if (d.x < HalfTD) { dd.z = 1.0;}
+  return(dd);
+}
+
+
+void DebugOutput(out half4 Color, in float4 baseTC)
+{
+  Color = 0;
+ #if %_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // 1000
+  float2 dd = 64.0 * (abs(ddx(baseTC.xy)) + abs(ddy(baseTC.xy)));
+  Color = float4(dd, 0, 1);
+ #elif !%_RT_DEBUG0 && %_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // 0100
+  float4 dd = baseTC;
+  Color = dd;
+ #elif %_RT_DEBUG0 && %_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // 1100
+  Color = DVColor(abs(ddx(baseTC.xy)));
+ #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // 0010
+  Color = DVColor(abs(ddy(baseTC.xy)));
+ #elif %_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3 // 1011
+  Color = DVColor(abs(ddy(baseTC.xy)));
+ #elif !%_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // 0110
+  float Reso = 512;
+  float TargetDeriv = 1.0/Reso;
+  float Diagonal = sqrt(2.0*TargetDeriv*TargetDeriv);
+  float HalfDiag = (Diagonal*0.5);
+  float TwoDiag = (Diagonal*2.0);
+  float2 dx = ddx(baseTC.xy);
+  float2 dy = ddy(baseTC.xy);
+  float d = sqrt(dot(dx,dx) + dot(dy,dy));
+  float4 dd = float4(0,0,0,1);
+  if (d > TwoDiag) { dd.x = 1.0;}
+  if (d > TwoDiag) { dd.y = 1.0;}
+  if (d < HalfDiag) { dd.z = 1.0;}
+  Color = dd;
+ #elif %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // 1110
+  float4 mipColor = tex2D(DebugMipColorsDiffuseSampler, baseTC.xy);
+  Color = mipColor;
+ #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && %_RT_DEBUG3 // 0001
+  float4 mipColor = tex2D(DebugMipColorsBumpSampler, baseTC.xy);
+  Color = mipColor;
+ #elif %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3 // 1111
+  Color.xyz = NumInstructions;	// Measure overdraw
+ #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3 // 0011
+  float x = frac(baseTC.x);
+  float y = frac(baseTC.y);
+  if((x < 0.5 && y < 0.5) || (x > 0.5 && y > 0.5))
+	Color = float4(3, 3, 0, 1);
+  else
+	Color = float4(0, 0, 3, 1);
+ #endif
+ // free:
+  // 1010
+  // 1001
+  // 0101
+  // 0111
+  // 1101
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+half4 GetTerrainTex(sampler2D s, float2 terrainTC)
+{
+  half4 cTerrain = tex2D(s, terrainTC);
+
+	// CIE to RGB
+//	half fScale = 3.0h * cTerrain.b;
+//	cTerrain.r = cTerrain.r * (31.0h/30.0h) + 0.001012 * (31.0h/30.0h); // 1 mad
+//	cTerrain.g *= 63.0f/63.0f;																							// 1 mul
+//	cTerrain.b = 1.0h - cTerrain.r - cTerrain.g;										// 2 adds
+//	cTerrain.rgb *= fScale;																									// 1 mul
+
+	return saturate(	cTerrain	);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float4 GetInputColor(in float4 Color)
+{
+  return Color.zyxw;
+}
+
+#define QUALITY_LOW      0
+#define QUALITY_MEDIUM   1
+#define QUALITY_HIGH   	 2
+#define QUALITY_VERYHIGH 3
+
+int GetShaderQuality()
+{
+  int nQuality;
+#if !%_RT_QUALITY && !%_RT_QUALITY1
+   nQuality = QUALITY_LOW;
+#elif %_RT_QUALITY && !%_RT_QUALITY1
+   nQuality = QUALITY_MEDIUM;
+#elif !%_RT_QUALITY && %_RT_QUALITY1
+   nQuality = QUALITY_HIGH;
+#else
+   // #warning Unknown shader quality mode
+   nQuality = QUALITY_VERYHIGH;
+#endif
+  return nQuality;
+}
+
+int GetMSAASampleNum()
+{
+  int nSamplesNum = 0;
+  return nSamplesNum;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float ComputeTextureLOD(in float2 uv, in float2 texDim)
+{
+	uv *= texDim;
+
+	float2 ddx_ = ddx(uv);
+	float2 ddy_ = ddy(uv);
+	//float2 mag = ddx_ * ddx_ + ddy_ * ddy_;
+	float2 mag = abs(ddx_) + abs(ddy_);
+
+	//float lod = max(0.5 * log2(max(mag.x, mag.y)), 0);
+	float lod = log2(max(mag.x, mag.y));
+	return lod;
+}
+
+float ComputeTextureLOD(in float2 uv, in float2 texDim, out float2 ddx_uv, out float2 ddy_uv)
+{
+	//float2 uvScaled = uv * texDim;
+	//float2 ddx_, ddy_;
+
+	//float4(ddx_, ddx_uv) = ddx(float4(uvScaled, uv));
+	//float4(ddy_, ddy_uv) = ddy(float4(uvScaled, uv));
+
+	////float2 mag = ddx_ * ddx_ + ddy_ * ddy_;
+	//float2 mag = abs(ddx_uv) + abs(ddy_uv);
+
+	ddx_uv = ddx(uv);
+	ddy_uv = ddy(uv);
+	//float2 mag = (ddx_uv * ddx_uv + ddy_uv * ddy_uv) * texDim * texDim;
+	float2 mag = (abs(ddx_uv) + abs(ddy_uv)) * texDim;
+
+	//float lod = max(0.5 * log2(max(mag.x, mag.y)), 0);
+	float lod = log2(max(mag.x, mag.y));
+	return lod;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float4 rgb10a2_to_rgb10a2f( float4 InColor )
+{
+	// Shift left 3 bits. This allows us to have the exponent and mantissa on opposite
+	// sides of the decimal point for extraction.
+	float4 OutColor = InColor * 8.0f;
+
+	// Extract the exponent and mantissa that are now on opposite sides of the decimal point
+	float3 e = floor( OutColor.rgb );
+	float3 m = frac( OutColor.rgb );
+
+	// Perform the 7e3 conversion.  Note that this varies on the value of e for each channel:
+	// if e != 0.0f then the correct conversion is (1+m)/8*pow(2,e).
+	// else it is (1+m)/8*pow(2,e).
+	OutColor.rgb  = (e == 0.0f) ? 2*m/8 : (1+m)/8 * exp2(e);
+
+	return OutColor;
+}
+
+// Fetches an rgb10a2f texture aliased as a rgb10a2 texture - check xbox documentation (7e3) for more details // ACCEPTED_USE
+//  - helpfull for specific cases to decrease BW (at cost of ALU) and also to minimize resolve cost
+//  - beware that this doens't support correct bilinear filtering fetches
+float4 tex2D_rgb10a2f( sampler2D s, float2 vTexCoord )
+{
+	return  rgb10a2_to_rgb10a2f( tex2D(s, vTexCoord ) );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if %ST_LLVM_DIRECTX_SHADER_COMPILER
+    // LLVM DirectX Shader Compiler doesn't have support for halfs yet. At the moment we are replacing all halfs
+    // with floats using regular expresions, making this function being declared twice and failing to compile the shader.
+#else
+half GetLuminance( half3 color )
+{
+	return dot( color, half3( 0.2126h, 0.7152h, 0.0722h ) );
+}
+#endif
+
+##if AZ_RESTRICTED_PLATFORM
+    ##include_restricted(Common_cfi, AZ_RESTRICTED_PLATFORM)
+##endif
+##if AZ_RESTRICTED_SECTION_IMPLEMENTED
+    ##undef AZ_RESTRICTED_SECTION_IMPLEMENTED
+##else
+float GetLuminance( float3 color )
+{
+	return dot( color, float3( 0.2126, 0.7152, 0.0722 ) );
+}
+##endif
+
+// Checks normalized sun light direction from level and applies it to the UV for the Cloud Shadows.
+float2 ComputeCloudShadowMapUV(in float3 worldPos)
+{
+#if %_PS
+	const float3 sunDir = PerFrame_SunDirection.xyz;
+#elif %_VS
+	const float3 sunDir = PerFrame_SunDirection.xyz;
+#elif %_CS
+	const float3 sunDir = PerFrame_SunDirection.xyz;
+#else
+	const float3 sunDir = normalize(float3(0.1, 0.1, 1.0));
+#endif
+	const float t = -worldPos.z / sunDir.z;
+	return worldPos.xy + t * sunDir.xy;
+}
+
+float4 GetScreenCoords(float4 WPos)
+{
+	return WPos * float4(PS_ScreenSize.zw * 2.0, 1, 1);
+}
+
+#if %DEPTH_FIXUP
+half DepthFixupThreshold
+<
+  register = PER_MATERIAL_0.z;
+  string UIName = "Threshold for writing depth";
+
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.01;
+> = 0.05;
+#endif
+
+void DepthFixupOutput(inout half4 Color, in float alpha, in half4 WPos)
+{
+#if %DEPTH_FIXUP && %_RT_DEPTHFIXUP
+	float4 tcScreen = GetScreenCoords(WPos);
+	const float fZ = tcScreen.w * PerView_NearFarClipDist.w;
+	Color.a = alpha > DepthFixupThreshold ? fZ : DEPTH_FIXUP_KEY;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Common GMEM paths functionalities. The following functions are to be used when the 128BPP and
+// 256BPP paths differ in behavior (eg. 128BPP path already resolved RTs that are still in  GMEM on
+// the 256BPP path).
+
+#define GmemDepthModeFetchRT        0
+#define GmemDepthModeFetchBuffer    1
+#define GmemDepthModeSampleTexture  2
+
+uint GmemGetDepthStencilSampleMode(const bool zPass)
+{
+#if %ST_GMEM_256BPP
+  return GmemDepthModeFetchRT;
+#else
+  if (zPass)
+  {
+    // Check if we are linearizing the depth/stencil in the ZPass
+    #if FEATURE_GMEM_LINEARIZE_DEPTH
+      return GmemDepthModeFetchRT;
+    #elif %ST_FEATURE_FETCH_DEPTHSTENCIL // Check if we can fetch the depth/stencil buffer
+      return GmemDepthModeFetchBuffer;
+    #endif
+  }
+
+  return GmemDepthModeSampleTexture;
+#endif
+}
+
+uint GmemGetStencilValue(Texture2D<uint2> stencilTexture, float2 uv, const bool zPass)
+{
+  const uint depthStencilSampleMode = GmemGetDepthStencilSampleMode(zPass);
+  if (depthStencilSampleMode == GmemDepthModeFetchRT)
+  {
+    return GMEM_LinDepthResSten.Load(int3(0,0,0)).y;
+  }
+  else if(depthStencilSampleMode == GmemDepthModeFetchBuffer)
+  {
+    return GMEM_StencilBuff.Load(int3(0,0,0)).x;
+  }
+  else
+  {
+    int3 vPixCoord = int3(uv * PS_ScreenSize.xy, 0);
+    return stencilTexture.Load(vPixCoord).y;
+  }
+}
+
+uint GmemGetStencilValue(sampler2D stencilSampler, float2 uv, const bool zPass)
+{
+  const uint depthStencilSampleMode = GmemGetDepthStencilSampleMode(zPass);
+  if (depthStencilSampleMode == GmemDepthModeFetchRT)
+  {
+    return GMEM_LinDepthResSten.Load(int3(0,0,0)).y;
+  }
+  else if(depthStencilSampleMode == GmemDepthModeFetchBuffer)
+  {
+    return GMEM_StencilBuff.Load(int3(0,0,0)).x;
+  }
+  else
+  {
+    return tex2D( stencilSampler, uv.xy ).y;
+  }
+}
+
+float GmemGetLinearDepth(sampler2D depthSampler, float2 ScreenTC, const bool zPass, bool bDrawNearAdjust=true)
+{
+  const uint depthStencilSampleMode = GmemGetDepthStencilSampleMode(zPass);
+  if (depthStencilSampleMode == GmemDepthModeFetchRT)
+  {
+    float depth = GMEM_LinDepthResSten.Load(int3(0,0,0)).x;
+    return GetLinearDepth(depth, bDrawNearAdjust);
+  }
+  else if(depthStencilSampleMode == GmemDepthModeFetchBuffer)
+  {
+    float depth = LinearizeDeviceDepth(GMEM_DepthBuff.Load(int3(0,0,0)).x);
+    return GetLinearDepth(depth, bDrawNearAdjust);
+  }
+  else
+  {
+    return GetLinearDepth(depthSampler, ScreenTC, bDrawNearAdjust);
+  }
+}
+
+float GmemGetLinearDepth(Texture2D depthTexture, int2 ScreenTC, const bool zPass, bool bDrawNearAdjust=true)
+{
+  const uint depthStencilSampleMode = GmemGetDepthStencilSampleMode(zPass);
+  if (depthStencilSampleMode == GmemDepthModeFetchRT)
+  {
+    float depth = GMEM_LinDepthResSten.Load(int3(0,0,0)).x;
+    return GetLinearDepth(depth, bDrawNearAdjust);
+  }
+  else if(depthStencilSampleMode == GmemDepthModeFetchBuffer)
+  {
+    float depth = LinearizeDeviceDepth(GMEM_DepthBuff.Load(int3(0,0,0)).x);
+    return GetLinearDepth(depth, bDrawNearAdjust);
+  }
+  else
+  {
+    return GetLinearDepth(depthTexture, ScreenTC, bDrawNearAdjust);
+  }
+}
+
+float GmemGetLinearDepth(Texture2D depthTexture, float2 ScreenTC, const bool zPass, bool bDrawNearAdjust=true)
+{
+  int2 screenUV = int2(ScreenTC * PS_ScreenSize.xy);
+  return GmemGetLinearDepth(depthTexture, screenUV, zPass, bDrawNearAdjust);
+}
+
+uint GmemGetResolvedStencil(uint nStencilVal)
+{
+    const uint BIT_STENCIL_STATIC        = 0x0000007F;
+    const uint BIT_STENCIL_INSIDE_VOLUME = 0x00000040;
+    nStencilVal &= BIT_STENCIL_STATIC;
+
+    int modifiedStencilVal = nStencilVal - BIT_STENCIL_INSIDE_VOLUME;
+    nStencilVal = max(modifiedStencilVal, 1);
+    return nStencilVal;
+}
+
+uint GmemGetStencilValueZPass()
+{
+    //For gmem path (except PLS) we are now writing the full stencil values during the gbuffer pass and do a quick stencil resolve (cleans out the stencil values) after deferred rain.
+    //This is done as deferred rain puddles need the full stencil id. Resolve stencil happens after deferred rain/snow.
+    //We cannot do this for pls as we can not sample from the LinDepthResSten rendertarget as it resides in slot 3.
+    //Deferred rain/snow is not supported for PLS so it should be fine.
+    #if %ST_GMEM_PLS
+        return GmemGetResolvedStencil((uint)(GmemStencilValue.x));
+    #else
+        return (uint)(GmemStencilValue.x);
+    #endif
+}
+
+//////////////////////////////// END GMEM ////////////////////////////////
+
+float w0(float a)
+{
+	return (1.0/6.0)*(a*(a*(-a + 3.0) - 3.0) + 1.0);
+}
+
+float w1(float a)
+{
+	return (1.0/6.0)*(a*a*(3.0*a - 6.0) + 4.0);
+}
+
+float w2(float a)
+{
+	return (1.0/6.0)*(a*(a*(-3.0*a + 3.0) + 3.0) + 1.0);
+}
+
+float w3(float a)
+{
+	return (1.0/6.0)*(a*a*a);
+}
+
+// g0 and g1 are the two amplitude functions
+float g0(float a)
+{
+	return w0(a) + w1(a);
+}
+
+float g1(float a)
+{
+	return w2(a) + w3(a);
+}
+
+// h0 and h1 are the two offset functions
+float h0(float a)
+{
+	return -1.0 + w1(a) / (w0(a) + w1(a));
+}
+
+float h1(float a)
+{
+	return 1.0 + w3(a) / (w2(a) + w3(a));
+}
+
+float4 tex2D_bicubic(sampler2D tex, float2 uv, float2 res)
+{
+	uv = uv * res + 0.5;
+	float2 iuv = floor( uv );
+	float2 fuv = frac( uv );
+
+	float g0x = g0(fuv.x);
+	float g1x = g1(fuv.x);
+	float h0x = h0(fuv.x);
+	float h1x = h1(fuv.x);
+	float h0y = h0(fuv.y);
+	float h1y = h1(fuv.y);
+
+	float2 p0 = (float2(iuv.x + h0x, iuv.y + h0y) - 0.5) / res;
+	float2 p1 = (float2(iuv.x + h1x, iuv.y + h0y) - 0.5) / res;
+	float2 p2 = (float2(iuv.x + h0x, iuv.y + h1y) - 0.5) / res;
+	float2 p3 = (float2(iuv.x + h1x, iuv.y + h1y) - 0.5) / res;
+
+	return g0(fuv.y) * (g0x * tex2D(tex, p0)  + g1x * tex2D(tex, p1)) + g1(fuv.y) * (g0x * tex2D(tex, p2) + g1x * tex2D(tex, p3));
+}
+
+float4 RGBMEncode( float3 color ) {
+    color = sqrt(color);
+    float4 rgbm;
+    color *= 1.0 / RGBM_MULTIPLIER;
+    rgbm.a = saturate( max( max( color.r, color.g ), max( color.b, 1e-6 ) ) );
+    rgbm.a = ceil( rgbm.a * 255.0 ) / 255.0;
+    rgbm.rgb = color / rgbm.a;
+    return rgbm;
+}
+
+float3 RGBMDecode( float4 rgbm ) {
+    return pow(RGBM_MULTIPLIER * rgbm.rgb * rgbm.a, 2);
+}

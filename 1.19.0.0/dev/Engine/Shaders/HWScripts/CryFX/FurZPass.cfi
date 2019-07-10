@@ -1,0 +1,267 @@
+/*
+* All or portions of this file Copyright (c) Amazon.com, Inc. or its affiliates or
+* its licensors.
+*
+* For complete copyright and license terms please see the LICENSE at the root of this
+* distribution (the "License"). All use of this software is governed by the License,
+* or, if provided, by the license below or the license accompanying this file. Do not
+* remove or modify any license notices. This file is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+*
+*/
+
+/*
+* This file handles Z passes for fur, which occurs in two passes:
+*   1) Base Z pass, where the mesh draws with normals bent for anistropic highlights.
+*      If self shadowing is turned on, the albedo specified for self shading is used.
+*   2) Outer shell Z pass, where mesh is extruded, only 1 in 4 pixels are drawn, and normals
+*      are bent for subsurface scattering and anisotropic highlights
+*/
+
+half4 GetZPassDiffuse(vert2fragZ IN)
+{
+    const float FurShellPercent = FurParams.w;
+    if (FurShellPercent == 0.0f)
+    {
+#if %FUR_VERT_COLORS
+        const float furEpsilon = 0.001f;
+        const bool  applyFurSelfShadow = (IN.Color.w > furEpsilon);  // do not self shadow if not within fur area
+#else // %FUR_VERT_COLORS
+        const bool  applyFurSelfShadow = true;  // do not self shadow if not within fur area
+#endif // %FUR_VERT_COLORS
+
+        // Base pass provides a different diffuse value based on blend flags specified
+#if %FUR_BLENDLAYER || %FUR_BLENDCOLOR
+            return GetFurAlbedo(IN.baseTC.xy, 0.0, IN.WPos.w, applyFurSelfShadow, false);
+#else // %FUR_BLENDLAYER || %FUR_BLENDCOLOR
+            return GetFurAlbedo(IN.baseTC.xy, 0.0, 0.0, applyFurSelfShadow, false);
+#endif // %FUR_BLENDLAYER || %FUR_BLENDCOLOR
+    }
+    else
+    {
+        // Outer shell pass always uses standard diffuse color
+        return GetDiffuseMap(diffuseMapSampler, IN.baseTC.xy);
+    }
+}
+
+#include "CommonZPass.cfi"
+
+struct vert2fragFurZ
+{
+    OUT_HPOS_IN_WPOS
+ 
+    float4 baseTC   : TEXCOORDN;   // modulated texture coordinates
+
+#if %DETAIL_MAPPING
+    float4 detailTC : TEXCOORDN;
+#endif
+
+    half4 vTangent  : TEXCOORDN;
+    half4 vBinormal : TEXCOORDN;
+    half4 vNormalWS : TEXCOORDN;
+
+    float4 vView    : TEXCOORDN;
+#if %FUR_VERT_COLORS
+    float4 vFurData : TEXCOORDN;    //  xyz - comb direction, w - fur length
+#endif
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+    float3 HPosCurr : TEXCOORDN;
+    float3 HPosPrev : TEXCOORDN;
+#endif
+
+    FRONT_FACE_PS
+};
+
+vert2fragFurZ Fur_ZPass_InternalVS(app2vertGBuffer IN, streamPos vertPassPos)
+{
+    // A trimmed down version of Common_ZPassVS, with fur shader data included in streamPos
+
+    vert2fragFurZ OUT = (vert2fragFurZ)0;
+
+    streamPos_FromGBuffer(IN, vertPassPos);
+    streamPos vertPassPosPrev = (streamPos)vertPassPos;
+ 
+    float4 HPosition = Pos_VS_General(PerView_ViewProjZeroMatr, vertPassPos);
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+    vertPassPosPrev.PositionCurr = vertPassPos.Position;
+    OUT.HPosCurr.xyz = HPosToScreenTC( HPosition ).xyw;
+    OUT.HPosPrev.xyz = HPosToScreenTC( GetPositionGeneralPrevious(vertPassPosPrev) ).xyw;
+#endif
+
+    // Preparing the inverse non-uniform matrix for correct vector transform
+    float3x3    instInvScaleMat = InverseScaleMatrixFast((const float3x3)vertPassPos.InstMatrix);
+
+    float3 viewRelativePos = vertPassPos.WorldPos.xyz - PerView_WorldViewPos.xyz;
+    OUT.vView.xyz = viewRelativePos;
+
+    OUT.HPosition = HPosition;
+
+    // Compensating for non-uniform scale
+    float3 worldTangentS = normalize(mul(instInvScaleMat, vertPassPos.ObjToTangentSpace[0]));
+    float3 worldTangentT = normalize(mul(instInvScaleMat, vertPassPos.ObjToTangentSpace[1]));
+    float3 worldTangentN = normalize(mul(instInvScaleMat, vertPassPos.ObjToTangentSpace[2]));
+	
+    float4 baseTC = vertPassPos.baseTC;  
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Output uv coordinates
+
+    // Apply texture modifiers
+    #if %DETAIL_MAPPING
+        #if %DETAIL_MAPPING_UV_SET_2
+            OUT.detailTC = _ModifyDetailUV(vertPassPos.baseTC2, vertPassPos.Position);
+        #else
+            OUT.detailTC = _ModifyDetailUV(baseTC, vertPassPos.Position);
+        #endif
+    #endif
+
+    _ModifyUV_1(baseTC, OUT.baseTC, vertPassPos.Position );
+
+    float dissolveOut = 0.0;
+    #if %_RT_DISSOLVE
+        float4 dissolveRef = GetInstance_DissolveRef(vertPassPos);
+        OUT.baseTC.z = dissolveRef.x;
+        dissolveOut = dissolveRef.y;
+    #endif
+    #if %_RT_ALPHATEST
+        OUT.baseTC.w = GetMaterial_AlphaTest();
+    #endif
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Output tangents
+
+    OUT.vNormalWS = float4(worldTangentN.xyz, dissolveOut); // w= dissolve out sign
+    OUT.vTangent = float4(worldTangentS, vertPassPos.Tangent.w);
+    OUT.vBinormal.xyz = worldTangentT;
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Output color
+    
+
+#if %FUR_VERT_COLORS
+    // Fur combing was already computed by the CustomModificator
+    OUT.vFurData.xyz = vertPassPos.CustomData.vFurCombWorld;
+    OUT.vFurData.w = vertPassPos.CustomData.furLengthScale;
+#endif
+
+    #if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %OFFSET_BUMP_MAPPING || %_RT_ALPHABLEND || %TEMP_EYES || %LEAVES || %GRASS
+        OUT.viewTS.xyz = viewRelativePos;
+    #endif
+
+    return OUT;
+}
+
+vert2fragFurZ FurBase_ZPassVS(app2vertGBuffer IN)
+{
+    streamPos vertPassPos = (streamPos)0;
+    vertPassPos.CustomData.bPrevPass = false;
+    vertPassPos.CustomData.shellDistance = 0;
+    #if %FUR_VERT_COLORS
+        vertPassPos.CustomData.vFurCombWorld = IN.vertCommon.Color.xyz;
+        vertPassPos.CustomData.furLengthScale = IN.vertCommon.Color.w;
+    #endif
+    return Fur_ZPass_InternalVS(IN, vertPassPos);
+}
+
+vert2fragFurZ FurOuterShell_ZPassVS(app2vertGBuffer IN)
+{
+    streamPos vertPassPos = (streamPos)0;
+    vertPassPos.CustomData.bPrevPass = false;
+    vertPassPos.CustomData.shellDistance = 1;
+    #if %FUR_VERT_COLORS
+        vertPassPos.CustomData.vFurCombWorld = IN.vertCommon.Color.xyz;
+        vertPassPos.CustomData.furLengthScale = IN.vertCommon.Color.w;
+    #endif
+    return Fur_ZPass_InternalVS(IN, vertPassPos);
+}
+
+vert2fragZ ApplyAnisotropyAndSSS(vert2fragFurZ IN, bool bAnisotropy, bool bSSS)
+{    
+    float3 vSSSOffset = float3(0.0, 0.0, 0.0);
+    if (bSSS)
+    {
+        // Subsurface scattering: bend normals away from camera to influence rim lighting
+        half nDotV = saturate(dot(IN.vNormalWS.xyz, -IN.vView));
+        half rimWeight = SSSStrength * pow(1 - nDotV, SSSFalloff);
+        vSSSOffset = IN.vView.xyz * rimWeight;
+    }
+    
+#if %FUR_VERT_COLORS
+    if (bAnisotropy)
+    {
+        // Anisotropy: Mutate normal to be coplanar to the view and combing vectors
+        // Anisotropy does not work currently without combing vectors encoded into the mesh's color channel
+        float3 direction = IN.vFurData.xyz;
+        direction = direction - (dot(direction, IN.vNormalWS.xyz) * IN.vNormalWS.xyz);
+        direction = normalize(direction);
+        float3 binorm = cross(IN.vView, direction);
+        float3 grainNorm = normalize(cross(binorm, direction));
+        float lerpVal = step(0.001, IN.vFurData.w); // Don't apply anisotropy to parts of the mesh that have no fur length
+        IN.vNormalWS.xyz = lerp(IN.vNormalWS.xyz, grainNorm, lerpVal);
+    }
+#endif
+
+    IN.vNormalWS.xyz += vSSSOffset;
+
+    vert2fragZ OUT = (vert2fragZ)0;
+    OUT.WPos = IN.WPos;
+    OUT.baseTC = IN.baseTC;
+#if %DETAIL_MAPPING
+    OUT.detailTC = IN.detailTC;
+#endif
+    OUT.vTangent = IN.vTangent;
+    OUT.vBinormal = IN.vBinormal;
+    OUT.vNormalWS = IN.vNormalWS;
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+    OUT.HPosCurr = IN.HPosCurr;
+    OUT.HPosPrev = IN.HPosPrev;
+#endif
+    OUT.bIsFrontFace = IN.bIsFrontFace;
+    return OUT;
+}
+
+pixout_gbuffer FurBase_ZPassPS(vert2fragFurZ IN)
+{
+    vert2fragZ IN_Z = ApplyAnisotropyAndSSS(IN, true, false); // Base pass does not apply SSS
+
+    return Common_ZPassPS(IN_Z);
+}
+
+pixout_gbuffer FurOuterShell_ZPassPS(vert2fragFurZ IN)
+{
+    // Discard pixels to make a 1 in 4 stipple pattern
+    float2 pixelCoord = floor(IN.WPos.xy); // Drop pixel center offset
+    clip( any(frac(pixelCoord * 0.5f)) ? -1.0f : 1.0f ); // If either x/y is odd, clip the frag
+
+    vert2fragZ IN_Z = ApplyAnisotropyAndSSS(IN, true, true);
+
+    return Common_ZPassPS(IN_Z);
+}
+
+technique FurZPass // Base surface
+{
+    pass p0
+    {
+        VertexShader = FurBase_ZPassVS() ZVS;
+        PixelShader = FurBase_ZPassPS() ZPS;
+
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = Back;
+    }
+}
+
+technique FurZPost // Outermost shell
+{
+    pass p0 
+    {
+        VertexShader = FurOuterShell_ZPassVS() ZVS;
+        PixelShader = FurOuterShell_ZPassPS() ZPS;
+
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = Back;
+    }
+}
