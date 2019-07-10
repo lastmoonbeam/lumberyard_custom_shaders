@@ -65,6 +65,8 @@
 #define PER_MATERIAL_10  c37
 #define PER_MATERIAL_11  c38
 #define PER_MATERIAL_12  c39
+#define PER_MATERIAL_13  c40
+#define PER_MATERIAL_14  c41
 
 float4 PerMaterial_DiffuseColor  : PM_DiffuseColor < register = PER_MATERIAL_DIFFUSE_COLOR >;
 float4 PerMaterial_SpecularColor : PM_SpecularColor < register = PER_MATERIAL_SPECULAR_COLOR >;

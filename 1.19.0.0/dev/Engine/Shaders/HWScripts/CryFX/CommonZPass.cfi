@@ -224,7 +224,7 @@ vert2fragZ Common_ZPassVS(app2vertGBuffer IN_common)
         #endif
     #endif
 
-    #if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %OFFSET_BUMP_MAPPING || %_RT_ALPHABLEND || %TEMP_EYES || %LEAVES || %GRASS
+    #if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %OFFSET_BUMP_MAPPING || %_RT_ALPHABLEND || %TEMP_EYES || %LEAVES || %GRASS || %RIM_LIGHT
         OUT.viewTS.xyz = viewRelativePos;
     #endif
 
@@ -316,6 +316,13 @@ void ApplyVegetationTerrainColor(vert2fragZ IN, inout half3 diffCol, inout half3
             diffCol = lerp(diffCol.xyz, terrainCol.xyz, IN.terrainParams0.z);
         #endif
     #endif
+}
+
+void ApplyRimLightColorForGBuff(vert2fragZ IN, inout half3 diffCol, in float3 normal)
+{    
+		float rim  = 1 - max(dot(normalize(-IN.viewTS.xyz), normal), 0.0);
+		float3 rimLight = pow(rim, RimLightPower.x) * RimLightColor.xyz;		
+		diffCol += rimLight;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -622,6 +629,10 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
 
 #if %DECAL
     cReflectance.xyz = GetLuminance(cReflectance.xyz);
+#endif
+
+#if %RIM_LIGHT
+	ApplyRimLightColorForGBuff(IN, cAlbedo, attribs.NormalWorld);
 #endif
     
     attribs.Albedo = cAlbedo;
